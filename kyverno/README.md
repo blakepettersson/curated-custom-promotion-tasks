@@ -25,11 +25,14 @@ examples/kyverno-policies/     a Helm chart of policies plus manifests, used by 
 
 ## Using a step
 
-Register it once per cluster (a cluster-admin action):
+Register it once per cluster (a cluster-admin action). Both resources are
+cluster-scoped and go in through the Kargo API — custom steps are an Akuity
+Platform feature, so there is no control plane to `kubectl apply` against:
 
 ```console
-kubectl apply -f steps/kyverno-validate/custom-promotion-step.yaml
-kubectl apply -f steps/kyverno-validate/examples/cluster-promotion-task.yaml
+kargo login https://<your-kargo-instance>
+kargo apply -f steps/kyverno-validate/custom-promotion-step.yaml
+kargo apply -f steps/kyverno-validate/examples/cluster-promotion-task.yaml
 ```
 
 Then reference it from a promotion template, by name, like a built-in step:

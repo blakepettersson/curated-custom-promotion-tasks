@@ -1,7 +1,10 @@
 # Registers the `kyverno-validate` step with a Kargo cluster. CustomPromotionStep
 # is cluster-scoped and can only be created by a Kargo cluster admin.
 #
-#   kubectl apply -f custom-promotion-step.yaml
+#   kargo apply -f custom-promotion-step.yaml
+#
+# Applied through the Kargo API rather than kubectl: custom steps are an Akuity
+# Platform feature, and the control plane there is not directly reachable.
 #
 # Requires Kargo on the Akuity Platform v1.10+ with the Promotion Controller
 # enabled and a self-hosted agent (custom steps run as pods).

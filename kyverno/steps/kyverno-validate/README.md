@@ -115,8 +115,13 @@ key missing, a path that matches nothing, an unusable value).
 ## Registering the step
 
 ```console
-kubectl apply -f custom-promotion-step.yaml
+kargo login https://<your-kargo-instance>
+kargo apply -f custom-promotion-step.yaml
 ```
+
+`kargo`, not `kubectl`: custom steps only exist on Kargo hosted by the Akuity
+Platform, whose control plane you do not have direct access to, so resources go
+in through the Kargo API.
 
 The manifest points at
 `ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:main`.
