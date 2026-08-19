@@ -95,6 +95,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # Without these, the action derives title and description from the
+          # repository and passes them as --label, overriding the Dockerfile's:
+          # every step image would advertise itself as the repository.
+          labels: |
+            org.opencontainers.image.title=kyverno-validate
+            org.opencontainers.image.description=Kargo custom promotion step that validates Kyverno policies with the Kyverno CLI
           tags: |
             type=raw,value=main,enable={{is_default_branch}}
             type=sha,prefix=sha-
