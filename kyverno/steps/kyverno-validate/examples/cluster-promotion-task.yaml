@@ -1,0 +1,66 @@
+# A reusable task that renders a Helm chart of Kyverno policies and validates
+# both the policies themselves and a set of manifests against them.
+#
+# Register it once per cluster, then reference it from any project's promotion
+# template (see stage.yaml).
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ClusterPromotionTask
+metadata:
+  name: validate-kyverno-policies
+spec:
+  vars:
+    # Git repository holding the policy chart. Required.
+    - name: repoURL
+    # Path to the chart within the repository.
+    - name: chartPath
+      value: charts/kyverno-policies
+    # Path to the manifests that are validated against the rendered policies.
+    - name: manifestsPath
+      value: manifests
+    # Helm release name used while rendering.
+    - name: releaseName
+      value: kyverno-policies
+    # fail | error | warn | none — which policy results fail the promotion.
+    - name: failOn
+      value: fail
+
+  steps:
+    - uses: git-clone
+      as: clone
+      config:
+        repoURL: ${{ vars.repoURL }}
+        checkout:
+          - commit: ${{ commitFrom(vars.repoURL).ID }}
+            path: ./src
+
+    - uses: helm-template
+      as: render
+      config:
+        path: ./src/${{ vars.chartPath }}
+        releaseName: ${{ vars.releaseName }}
+        outPath: ./rendered
+        outLayout: flat
+        valuesFiles:
+          - ./src/${{ vars.chartPath }}/values.yaml
+          # Optional per-stage overlay, e.g. values-prod.yaml.
+          - ./src/${{ vars.chartPath }}/values-${{ ctx.stage }}.yaml
+        ignoreMissingValueFiles: true
+
+    # Loads every rendered policy through the Kyverno CLI, then applies the
+    # policies to the repository's manifests.
+    - uses: kyverno-validate
+      as: validate
+      config:
+        policies: ./rendered
+        manifests: ./src/${{ vars.manifestsPath }}
+        failOn: ${{ vars.failOn }}
+        detailedResults: true
+
+    # Expose a few results to the promotion template that called this task.
+    - uses: compose-output
+      as: output
+      config:
+        renderedPath: ./rendered
+        ruleCount: ${{ task.outputs['validate'].ruleCount }}
+        violationCount: ${{ task.outputs['validate'].violationCount }}
+        summary: ${{ task.outputs['validate'].message }}

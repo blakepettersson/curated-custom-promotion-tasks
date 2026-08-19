@@ -1,0 +1,10 @@
+# The policy's namespace exclusion precondition should skip this one.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: infra
+  namespace: kube-system
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/nginx:1.27

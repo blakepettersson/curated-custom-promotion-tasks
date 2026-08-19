@@ -1,0 +1,441 @@
+#!/bin/sh
+# kyverno-validate — validate Kyverno policy manifests with the Kyverno CLI.
+#
+# Runs as the command of a Kargo `CustomPromotionStep`. Configuration arrives as
+# a single JSON object in $KYVERNO_VALIDATE_CONFIG (the step spec passes
+# `${{ asJSON(config) }}`), results are written as JSON to $KARGO_OUTPUT.
+#
+# Three phases, all optional except the first:
+#
+#   1. load   — every policy file is loaded by the Kyverno CLI on its own, so a
+#               file that fails schema validation is reported with its path and
+#               reason. This phase exists because `kyverno apply` *silently
+#               skips* unparsable files (and silently skips an entire directory
+#               when any file in it is unparsable) and still exits 0.
+#   2. apply  — policies are applied to the manifests under test and the
+#               resulting policy report decides the outcome (config: `manifests`).
+#   3. test   — `kyverno test` runs Kyverno test suites (config: `tests`).
+#
+# Exits non-zero when validation fails, which fails the promotion step.
+
+set -eu
+
+PROBE_RESOURCE="${KYVERNO_VALIDATE_PROBE:-/etc/kyverno-validate/probe.yaml}"
+CONFIG="${KYVERNO_VALIDATE_CONFIG-}"
+KARGO_OUTPUT="${KARGO_OUTPUT:-/dev/null}"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+ESC="$(printf '\033')"
+
+# Documents that load cleanly but are not Kyverno policies at all. Charts
+# routinely render ConfigMaps, workloads or other CRDs next to their policies.
+NON_POLICY_ERRORS='policy type not supported|failed to locate OpenAPI spec for GV'
+
+# Kinds that are expected to contribute policy rules. PolicyException and the
+# cleanup kinds are deliberately absent: they hold no rules.
+POLICY_KINDS='ClusterPolicy|Policy|ValidatingPolicy|MutatingPolicy|ImageValidatingPolicy|GeneratingPolicy|DeletingPolicy'
+
+log() { printf '%s\n' "$*"; }
+
+fatal() {
+  printf 'kyverno-validate: %s\n' "$*" >&2
+  exit 2
+}
+
+strip_ansi() { sed "s/${ESC}\[[0-9;]*m//g"; }
+
+# --- configuration ----------------------------------------------------------
+
+# Kargo renders `asJSON(config)` as "null" for a step with no config at all.
+case "$(printf '%s' "$CONFIG" | tr -d ' \t\n')" in
+  '' | null) CONFIG='{}' ;;
+esac
+# Checked here rather than in the accessors below: those all run inside command
+# substitutions, where an `exit` would only leave the subshell.
+printf '%s' "$CONFIG" | jq -e 'type == "object"' > /dev/null 2>&1 ||
+  fatal 'KYVERNO_VALIDATE_CONFIG must be a JSON object'
+
+cfg_scalar() { # key default
+  # `has` rather than `//` so that a configured `false` is not mistaken for
+  # an absent key.
+  printf '%s' "$CONFIG" | jq -r --arg k "$1" --arg d "$2" '
+    (if has($k) and .[$k] != null then .[$k] else $d end)
+    | tostring | if . == "<nil>" or . == "" then $d else . end
+  '
+}
+
+cfg_bool() { # key default(true|false)
+  case "$(cfg_scalar "$1" "$2" | tr '[:upper:]' '[:lower:]')" in
+    true | yes | 1) printf 'true' ;;
+    *) printf 'false' ;;
+  esac
+}
+
+# cfg_tokens writes one token per line to a file. Accepts a string (split on
+# commas and newlines) or an array of strings. Tokens are kept in files rather
+# than variables so that iterating them cannot pathname-expand a glob before it
+# is used.
+cfg_tokens() { # key out-file
+  printf '%s' "$CONFIG" | jq -r --arg k "$1" '
+    (if has($k) and .[$k] != null then .[$k] else empty end)
+    | (if type == "array" then . else [tostring] end)
+    | map(select(. != null and . != "<nil>"))
+    | .[]
+  ' | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' \
+    > "$2" || true
+}
+
+cfg_tokens policies "$TMP/policy-paths.txt"
+# The manifests to validate. `resources` is accepted as an alias, matching the
+# Kyverno CLI's own --resource flag.
+cfg_tokens manifests "$TMP/manifest-paths.txt"
+[ -s "$TMP/manifest-paths.txt" ] || cfg_tokens resources "$TMP/manifest-paths.txt"
+cfg_tokens exceptions "$TMP/exception-paths.txt"
+cfg_tokens tests "$TMP/test-paths.txt"
+cfg_tokens exclude "$TMP/exclude.txt"
+cfg_tokens extraArgs "$TMP/extra-args.txt"
+
+VALUES_FILE="$(cfg_scalar valuesFile '')"
+FAIL_ON="$(cfg_scalar failOn 'fail')"
+REQUIRE_POLICIES="$(cfg_bool requirePolicies true)"
+DETAILED="$(cfg_bool detailedResults false)"
+MAX_VIOLATIONS="$(cfg_scalar maxViolations 20)"
+
+[ -s "$TMP/policy-paths.txt" ] || fatal 'config.policies is required'
+
+case "$MAX_VIOLATIONS" in
+  '' | *[!0-9]*) fatal "config.maxViolations must be a non-negative integer (got \"$MAX_VIOLATIONS\")" ;;
+esac
+
+case "$FAIL_ON" in
+  fail | error | warn | none) ;;
+  *) fatal "config.failOn must be one of fail, error, warn, none (got \"$FAIL_ON\")" ;;
+esac
+
+[ -f "$PROBE_RESOURCE" ] || fatal "probe resource $PROBE_RESOURCE not found"
+
+# --- path resolution --------------------------------------------------------
+
+# yaml_files lists candidate manifests under a directory.
+yaml_files() {
+  find "$1" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) | sort
+}
+
+# expand_paths turns files, directories and globs into a file list.
+expand_paths() { # pattern...
+  for pattern in "$@"; do
+    if [ -d "$pattern" ]; then
+      yaml_files "$pattern"
+    elif [ -e "$pattern" ]; then
+      printf '%s\n' "$pattern"
+    else
+      matched=0
+      # Unquoted: the shell performs pathname expansion here.
+      for match in $pattern; do
+        [ -e "$match" ] || continue
+        matched=1
+        if [ -d "$match" ]; then yaml_files "$match"; else printf '%s\n' "$match"; fi
+      done
+      [ "$matched" = 1 ] || fatal "no files matched path \"$pattern\""
+    fi
+  done
+}
+
+# expand_path_file resolves every path in a token file to a sorted file list.
+# `expand_paths` is redirected rather than piped: its `fatal` has to be able to
+# stop the script, which it cannot do from the left-hand side of a pipeline.
+expand_path_file() { # token-file out-file
+  # Saved before `set --` clears the function's positional parameters.
+  token_file="$1"
+  expanded_file="$2"
+  set --
+  while IFS= read -r path; do set -- "$@" "$path"; done < "$token_file"
+  if [ "$#" = 0 ]; then
+    : > "$expanded_file"
+    return 0
+  fi
+  expand_paths "$@" > "$TMP/expanded"
+  sort -u < "$TMP/expanded" > "$expanded_file"
+}
+
+# --- collect policy files ---------------------------------------------------
+
+expand_path_file "$TMP/policy-paths.txt" "$TMP/candidates.txt"
+
+: > "$TMP/policies.txt"
+while IFS= read -r file; do
+  base="$(basename "$file")"
+  # Kyverno test suites are inputs to `kyverno test`, not policies.
+  case "$base" in
+    kyverno-test.yaml | kyverno-test.yml) continue ;;
+  esac
+  skip=0
+  while IFS= read -r pattern; do
+    # shellcheck disable=SC2254 # pattern is intentionally a glob
+    case "$file" in $pattern) skip=1 ;; esac
+    # shellcheck disable=SC2254
+    case "$base" in $pattern) skip=1 ;; esac
+  done < "$TMP/exclude.txt"
+  [ "$skip" = 0 ] && printf '%s\n' "$file" >> "$TMP/policies.txt"
+done < "$TMP/candidates.txt"
+
+POLICY_FILE_COUNT="$(wc -l < "$TMP/policies.txt" | tr -d ' ')"
+if [ "$POLICY_FILE_COUNT" = 0 ]; then
+  fatal "no policy manifests found under: $(tr '\n' ' ' < "$TMP/policy-paths.txt")"
+fi
+
+log "==> Loading $POLICY_FILE_COUNT policy manifest(s) with kyverno $(kyverno version 2>/dev/null | sed -n 's/^Version: *//p' | head -1)"
+
+# --- phase 1: load check ----------------------------------------------------
+
+: > "$TMP/load-errors.tsv"
+: > "$TMP/loaded.txt"
+TOTAL_RULES=0
+NON_POLICY_COUNT=0
+
+record_load_error() { # file message
+  printf '%s\t%s\n' "$1" "$2" >> "$TMP/load-errors.tsv"
+  log "    ✗ $1: $2"
+}
+
+while IFS= read -r file; do
+  set +e
+  stdout="$(kyverno apply "$file" --resource "$PROBE_RESOURCE" -v 3 2> "$TMP/stderr")"
+  set -e
+
+  # The CLI reports an unloadable file on stderr and carries on with an exit
+  # code of 0, so its log is the only signal that a file was rejected. Both
+  # "skipping invalid YAML file" (schema violations) and "Non-fatal parsing
+  # error" (malformed YAML) carry the reason in a quoted error= field.
+  strip_ansi < "$TMP/stderr" |
+    sed -n 's/.*[[:space:]]error="//p' |
+    sed 's/"[[:space:]]*logger=.*$//; s/\\"/"/g' |
+    grep '^failed to ' > "$TMP/file-messages" || true
+
+  grep -Ev "$NON_POLICY_ERRORS" "$TMP/file-messages" > "$TMP/file-errors" || true
+
+  if [ -s "$TMP/file-errors" ]; then
+    while IFS= read -r message; do
+      record_load_error "$file" "$message"
+    done < "$TMP/file-errors"
+    continue
+  fi
+
+  rules="$(printf '%s\n' "$stdout" |
+    sed -n 's/^Applying \([0-9]\{1,\}\) policy rule(s).*/\1/p' | head -1)"
+  rules="${rules:-0}"
+
+  if [ "$rules" != 0 ]; then
+    TOTAL_RULES=$((TOTAL_RULES + rules))
+    printf '%s\n' "$file" >> "$TMP/loaded.txt"
+    log "    ✓ $file: $rules rule(s)"
+  elif grep -Eq "^kind:[[:space:]]*\"?($POLICY_KINDS)\"?[[:space:]]*$" "$file"; then
+    # A policy the CLI accepted but that carries no rules — what a Helm range
+    # over an empty list renders. It would install as a no-op.
+    record_load_error "$file" 'declares a Kyverno policy but contributed no policy rules'
+  else
+    NON_POLICY_COUNT=$((NON_POLICY_COUNT + 1))
+    log "    - $file: no Kyverno policies here (skipped)"
+  fi
+done < "$TMP/policies.txt"
+
+LOAD_ERROR_COUNT="$(wc -l < "$TMP/load-errors.tsv" | tr -d ' ')"
+jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {file: .[0], error: .[1]})' \
+  < "$TMP/load-errors.tsv" > "$TMP/load-errors.json"
+
+FAILED=false
+MESSAGES=""
+
+add_message() {
+  if [ -z "$MESSAGES" ]; then MESSAGES="$1"; else MESSAGES="$MESSAGES; $1"; fi
+}
+
+if [ "$LOAD_ERROR_COUNT" != 0 ]; then
+  FAILED=true
+  add_message "$LOAD_ERROR_COUNT policy manifest(s) failed to load"
+fi
+
+if [ "$TOTAL_RULES" = 0 ] && [ "$REQUIRE_POLICIES" = true ] && [ "$LOAD_ERROR_COUNT" = 0 ]; then
+  FAILED=true
+  add_message "no Kyverno policy rules found (set requirePolicies: false to allow this)"
+fi
+
+# --- phase 2: apply the policies to the manifests under test ----------------
+
+SUMMARY='{"pass":0,"fail":0,"warn":0,"error":0,"skip":0}'
+VIOLATIONS='[]'
+VIOLATION_COUNT=0
+MANIFEST_COUNT=0
+APPLIED=false
+fail_count=0
+error_count=0
+warn_count=0
+
+if [ -s "$TMP/manifest-paths.txt" ] && [ "$FAILED" = false ] && [ -s "$TMP/loaded.txt" ]; then
+  APPLIED=true
+
+  expand_path_file "$TMP/manifest-paths.txt" "$TMP/manifests.txt"
+  MANIFEST_COUNT="$(wc -l < "$TMP/manifests.txt" | tr -d ' ')"
+  expand_path_file "$TMP/exception-paths.txt" "$TMP/exceptions.txt"
+
+  set --
+  while IFS= read -r file; do set -- "$@" "$file"; done < "$TMP/loaded.txt"
+  while IFS= read -r file; do set -- "$@" --resource "$file"; done < "$TMP/manifests.txt"
+  while IFS= read -r file; do set -- "$@" --exception "$file"; done < "$TMP/exceptions.txt"
+
+  [ -n "$VALUES_FILE" ] && set -- "$@" --values-file "$VALUES_FILE"
+  [ "$DETAILED" = true ] && set -- "$@" --detailed-results
+  while IFS= read -r arg; do set -- "$@" "$arg"; done < "$TMP/extra-args.txt"
+
+  log "==> Applying policies to $MANIFEST_COUNT manifest(s)"
+
+  set +e
+  kyverno apply "$@" --policy-report --output-format json \
+    > "$TMP/report.json" 2> "$TMP/apply-stderr"
+  APPLY_RC=$?
+  set -e
+
+  strip_ansi < "$TMP/apply-stderr" | grep -v '^[[:space:]]*$' | head -50 || true
+
+  if [ -s "$TMP/report.json" ] && jq -e '.summary' "$TMP/report.json" > /dev/null 2>&1; then
+    SUMMARY="$(jq -c '{
+      pass: (.summary.pass // 0), fail: (.summary.fail // 0),
+      warn: (.summary.warn // 0), error: (.summary.error // 0),
+      skip: (.summary.skip // 0)
+    }' "$TMP/report.json")"
+    VIOLATIONS="$(jq -c --argjson max "$MAX_VIOLATIONS" '
+      [ .results[]?
+        | select(.result == "fail" or .result == "error" or .result == "warn")
+        | {
+            policy: .policy,
+            rule: .rule,
+            result: .result,
+            resource: ([ (.resources[0].kind // "?"), (.resources[0].namespace // ""),
+                         (.resources[0].name // "?") ] | map(select(. != "")) | join("/")),
+            message: (.message // "")
+          }
+      ] | .[:$max]' "$TMP/report.json")"
+  elif [ "$APPLY_RC" = 0 ]; then
+    # No results at all: none of the loaded policies matched any of the
+    # manifests. The CLI writes no report and exits 0.
+    log '    no policy matched the given manifests'
+  else
+    FAILED=true
+    add_message "kyverno apply exited $APPLY_RC without producing a policy report"
+  fi
+
+  fail_count="$(printf '%s' "$SUMMARY" | jq -r '.fail')"
+  error_count="$(printf '%s' "$SUMMARY" | jq -r '.error')"
+  warn_count="$(printf '%s' "$SUMMARY" | jq -r '.warn')"
+  pass_count="$(printf '%s' "$SUMMARY" | jq -r '.pass')"
+  skip_count="$(printf '%s' "$SUMMARY" | jq -r '.skip')"
+  VIOLATION_COUNT=$((fail_count + error_count))
+
+  log "    pass: $pass_count, fail: $fail_count, warn: $warn_count, error: $error_count, skip: $skip_count"
+  printf '%s' "$VIOLATIONS" | jq -r '.[] | "    ✗ \(.result): \(.policy)/\(.rule) on \(.resource): \(.message)"'
+
+  case "$FAIL_ON" in
+    fail)
+      if [ "$fail_count" != 0 ] || [ "$error_count" != 0 ]; then
+        FAILED=true
+        add_message "$fail_count failing and $error_count erroring policy result(s)"
+      fi
+      ;;
+    error)
+      if [ "$error_count" != 0 ]; then
+        FAILED=true
+        add_message "$error_count erroring policy result(s)"
+      fi
+      ;;
+    warn)
+      if [ "$fail_count" != 0 ] || [ "$error_count" != 0 ] || [ "$warn_count" != 0 ]; then
+        FAILED=true
+        add_message "$fail_count failing, $error_count erroring, $warn_count warning policy result(s)"
+      fi
+      ;;
+    none) ;;
+  esac
+fi
+
+if [ -s "$TMP/manifest-paths.txt" ] && [ "$APPLIED" = false ] && [ "$FAILED" = false ]; then
+  log '==> Skipping the apply phase: no policies were loaded'
+fi
+
+# --- phase 3: kyverno test suites -------------------------------------------
+
+TESTED=false
+if [ -s "$TMP/test-paths.txt" ] && [ "$FAILED" = false ]; then
+  TESTED=true
+  while IFS= read -r path; do
+    log "==> Running kyverno test $path"
+    set +e
+    kyverno test "$path" > "$TMP/test-output" 2>&1
+    test_rc=$?
+    set -e
+    strip_ansi < "$TMP/test-output" | head -200
+    if [ "$test_rc" != 0 ]; then
+      FAILED=true
+      add_message "kyverno test $path exited $test_rc"
+    fi
+  done < "$TMP/test-paths.txt"
+fi
+
+# --- results ----------------------------------------------------------------
+
+if [ "$FAILED" = true ]; then
+  PASSED=false
+  [ -n "$MESSAGES" ] || MESSAGES='validation failed'
+else
+  PASSED=true
+  # Never claim compliance that was not established: tolerated violations and a
+  # skipped apply phase both have to show up here, since this message ends up in
+  # commit messages and notifications.
+  add_message "$TOTAL_RULES policy rule(s) in $POLICY_FILE_COUNT file(s) are valid"
+  if [ "$APPLIED" = true ]; then
+    if [ "$VIOLATION_COUNT" != 0 ] || [ "$warn_count" != 0 ]; then
+      add_message "$fail_count failing, $error_count erroring and $warn_count warning result(s) tolerated by failOn: $FAIL_ON"
+    else
+      add_message "$MANIFEST_COUNT manifest(s) comply"
+    fi
+  elif [ -s "$TMP/manifest-paths.txt" ]; then
+    add_message 'manifests were not checked: no policies were loaded'
+  fi
+fi
+
+jq -n \
+  --argjson passed "$PASSED" \
+  --argjson policyFileCount "$POLICY_FILE_COUNT" \
+  --argjson ruleCount "$TOTAL_RULES" \
+  --argjson nonPolicyFileCount "$NON_POLICY_COUNT" \
+  --argjson loadErrorCount "$LOAD_ERROR_COUNT" \
+  --argjson loadErrors "$(cat "$TMP/load-errors.json")" \
+  --argjson applied "$APPLIED" \
+  --argjson manifestCount "$MANIFEST_COUNT" \
+  --argjson tested "$TESTED" \
+  --argjson summary "$SUMMARY" \
+  --argjson violationCount "$VIOLATION_COUNT" \
+  --argjson violations "$VIOLATIONS" \
+  --arg message "$MESSAGES" \
+  '{
+    passed: $passed,
+    message: $message,
+    policyFileCount: $policyFileCount,
+    nonPolicyFileCount: $nonPolicyFileCount,
+    ruleCount: $ruleCount,
+    loadErrorCount: $loadErrorCount,
+    loadErrors: $loadErrors,
+    applied: $applied,
+    manifestCount: $manifestCount,
+    tested: $tested,
+    summary: $summary,
+    violationCount: $violationCount,
+    violations: $violations
+  }' > "$TMP/output.json"
+
+cat "$TMP/output.json" > "$KARGO_OUTPUT"
+
+log "==> $MESSAGES"
+
+[ "$PASSED" = true ] || exit 1

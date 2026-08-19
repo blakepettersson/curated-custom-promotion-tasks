@@ -1,0 +1,4 @@
+# Stage overlay: block violating workloads outright in production.
+validate:
+  allowedRepos:
+    validationFailureAction: Enforce

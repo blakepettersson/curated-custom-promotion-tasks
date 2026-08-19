@@ -1,0 +1,81 @@
+{{- if and .Values.validate.enabled .Values.validate.allowedRepos.enabled }}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: allowed-repos
+  labels:
+    {{- include "kyverno-policies.labels" . | nindent 4 }}
+  annotations:
+    policies.kyverno.io/title: Allowed Repositories
+    policies.kyverno.io/category: Best Practices, Security
+    policies.kyverno.io/minversion: 1.6.0
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod, Image
+    policies.kyverno.io/description: >-
+      Requires container images to begin with a string from the specified list of allowed repositories.
+      This prevents the use of unauthorized or untrusted container registries. To prevent bypasses,
+      ensure a '/' is added when specifying DockerHub repositories or custom registries.
+      This policy checks all containers, initContainers, and ephemeralContainers.
+spec:
+  validationFailureAction: {{ .Values.validate.allowedRepos.validationFailureAction }}
+  background: {{ .Values.validate.allowedRepos.background }}
+  emitWarning: {{ .Values.validate.emitWarnings }}
+  rules:
+    - name: validate-image-repo
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      context:
+      {{- include "kyverno-policies.namespaceExclusionContext" . | nindent 8 }}
+      preconditions:
+        all:
+        {{- include "kyverno-policies.namespaceExclusionPrecondition" . | nindent 10 }}
+      validate:
+        message: "Container image does not match allowed repository prefixes: {{ join ", " .Values.validate.allowedRepos.repos }}."
+        foreach:
+          - list: "request.object.spec.containers[]"
+            anyPattern:
+            {{- range .Values.validate.allowedRepos.repos }}
+            - image: "{{ . }}*"
+            {{- end }}
+    - name: validate-initcontainer-repo
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      context:
+      {{- include "kyverno-policies.namespaceExclusionContext" . | nindent 8 }}
+      preconditions:
+        all:
+        {{- include "kyverno-policies.namespaceExclusionPrecondition" . | nindent 10 }}
+      validate:
+        message: "InitContainer image does not match allowed repository prefixes: {{ join ", " .Values.validate.allowedRepos.repos }}."
+        foreach:
+          - list: "(request.object.spec.initContainers || request.oldObject.spec.initContainers || [])"
+            anyPattern:
+            {{- range .Values.validate.allowedRepos.repos }}
+            - image: "{{ . }}*"
+            {{- end }}
+    - name: validate-ephemeralcontainer-repo
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      context:
+      {{- include "kyverno-policies.namespaceExclusionContext" . | nindent 8 }}
+      preconditions:
+        all:
+        {{- include "kyverno-policies.namespaceExclusionPrecondition" . | nindent 10 }}
+      validate:
+        message: "EphemeralContainer image does not match allowed repository prefixes: {{ join ", " .Values.validate.allowedRepos.repos }}."
+        foreach:
+          - list: "(request.object.spec.ephemeralContainers || request.oldObject.spec.ephemeralContainers || [])"
+            anyPattern:
+            {{- range .Values.validate.allowedRepos.repos }}
+            - image: "{{ . }}*"
+            {{- end }}
+  {{- end }}

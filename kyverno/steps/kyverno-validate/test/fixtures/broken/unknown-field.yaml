@@ -1,0 +1,17 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: unknown-field
+spec:
+  rules:
+    - name: typo
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        messsage: "this key is misspelled"
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"

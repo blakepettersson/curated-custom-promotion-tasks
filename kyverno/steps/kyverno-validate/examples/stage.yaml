@@ -1,0 +1,71 @@
+# A Stage that promotes Kyverno policies only when they are valid: the task
+# renders and validates them, and the remaining steps publish the rendered
+# output to a stage branch for Argo CD to sync.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: prod
+  namespace: kyverno-policies
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: policies
+      sources:
+        stages:
+          - stage
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: repoURL
+          value: https://github.com/example/kyverno-policies.git
+
+      steps:
+        # Renders the chart to ./rendered and fails the promotion if any policy
+        # is invalid or any manifest violates one.
+        - task:
+            name: validate-kyverno-policies
+            kind: ClusterPromotionTask
+          as: policies
+          vars:
+            - name: repoURL
+              value: ${{ vars.repoURL }}
+
+        - uses: git-clone
+          config:
+            repoURL: ${{ vars.repoURL }}
+            checkout:
+              - branch: stage/${{ ctx.stage }}
+                create: true
+                path: ./out
+
+        - uses: git-clear
+          config:
+            path: ./out
+
+        - uses: copy
+          config:
+            inPath: ${{ outputs.policies.renderedPath }}
+            outPath: ./out
+
+        - uses: git-commit
+          as: commit
+          config:
+            path: ./out
+            message: |
+              Promote ${{ ctx.stage }} policies
+
+              ${{ outputs.policies.summary }}
+
+        - uses: git-push
+          config:
+            path: ./out
+
+        - uses: argocd-update
+          config:
+            apps:
+              - name: kyverno-policies-${{ ctx.stage }}
+                sources:
+                  - repoURL: ${{ vars.repoURL }}
+                    desiredRevision: ${{ outputs.commit.commit }}

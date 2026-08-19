@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: violating
+  namespace: apps
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/nginx:1.27

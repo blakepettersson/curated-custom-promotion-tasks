@@ -1,0 +1,5 @@
+apiVersion: v2
+name: kyverno-policies
+description: Example Kyverno policy chart used to exercise the kyverno-validate promotion step
+type: application
+version: 0.1.0

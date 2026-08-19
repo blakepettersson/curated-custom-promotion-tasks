@@ -1,0 +1,9 @@
+# A CRD Kyverno knows nothing about, rendered next to policies. Not a policy,
+# not an error.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno-policies
+spec:
+  destination:
+    server: https://kubernetes.default.svc

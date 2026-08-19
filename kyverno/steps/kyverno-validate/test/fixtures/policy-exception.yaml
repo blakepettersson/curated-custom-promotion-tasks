@@ -1,0 +1,16 @@
+# PolicyExceptions carry no rules of their own.
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: exempt-legacy
+  namespace: default
+spec:
+  exceptions:
+    - policyName: disallow-latest-tag
+      ruleNames:
+        - require-image-tag
+  match:
+    any:
+      - resources:
+          kinds:
+            - Pod

@@ -1,0 +1,10 @@
+# Inert resource used only to make `kyverno apply` load a policy file: the CLI
+# refuses to run without a resource or a cluster connection. Policy results
+# against this resource are discarded — the load phase only cares about whether
+# each policy file parses and validates.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kyverno-validate-probe
+  namespace: default
+data: {}

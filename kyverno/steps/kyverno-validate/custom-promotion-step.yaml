@@ -1,0 +1,44 @@
+# Registers the `kyverno-validate` step with a Kargo cluster. CustomPromotionStep
+# is cluster-scoped and can only be created by a Kargo cluster admin.
+#
+#   kubectl apply -f custom-promotion-step.yaml
+#
+# Requires Kargo on the Akuity Platform v1.10+ with the Promotion Controller
+# enabled and a self-hosted agent (custom steps run as pods).
+apiVersion: ee.kargo.akuity.io/v1alpha1
+kind: CustomPromotionStep
+metadata:
+  name: kyverno-validate
+spec:
+  # Published by ../../../.github/workflows/kyverno-validate.yaml. Pin a released
+  # tag (or a digest) for production use, e.g.
+  # ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:v0.1.0
+  image: ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:main
+
+  command: ["/usr/local/bin/kyverno-validate"]
+
+  # The whole step config is handed over as one JSON object, so every key below
+  # is optional as far as the expression engine is concerned and nested values
+  # (lists of paths, for instance) survive intact.
+  env:
+    - name: KYVERNO_VALIDATE_CONFIG
+      value: ${{ asJSON(config) }}
+
+  # The step writes its results to $KARGO_OUTPUT as JSON.
+  output:
+    source:
+      type: Pipe
+      format: JSON
+
+  defaultTimeout: 10m
+  # Validation is deterministic: a retry cannot turn a rejected policy into an
+  # accepted one, so fail on the first attempt.
+  defaultErrorThreshold: 1
+
+  # The Kyverno CLI holds the whole policy and resource set in memory.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      memory: 1Gi

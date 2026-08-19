@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: compliant
+  namespace: apps
+spec:
+  containers:
+    - name: app
+      image: prod-images.example.com/team/app:1.4.2

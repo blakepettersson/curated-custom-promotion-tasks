@@ -1,0 +1,8 @@
+# No Pod-scoped policy matches this, so the policy report comes back empty.
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+spec:
+  ports:
+    - port: 80

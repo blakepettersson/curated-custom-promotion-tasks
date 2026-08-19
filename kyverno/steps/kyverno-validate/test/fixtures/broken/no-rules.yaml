@@ -1,0 +1,7 @@
+# What a Helm `range` over an empty list renders: the CLI accepts this and
+# reports zero rules, so it would install as a no-op.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: no-rules
+spec: {}

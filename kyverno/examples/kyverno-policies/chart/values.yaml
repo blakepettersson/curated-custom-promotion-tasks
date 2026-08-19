@@ -1,0 +1,20 @@
+# Namespaces that every policy in this chart ignores.
+excludedNamespaces:
+  - kube-system
+  - kyverno
+
+validate:
+  enabled: true
+  emitWarnings: true
+
+  allowedRepos:
+    enabled: true
+    # Enforce or Audit.
+    validationFailureAction: Audit
+    background: true
+    # Allowed repository prefixes. Keep the trailing '/' so that
+    # "example.com.evil.io/..." cannot pass as "example.com/...".
+    repos:
+      - "prod-images.example.com/"
+      - "base-images.example.com/"
+      - "platform-images.example.com/"
