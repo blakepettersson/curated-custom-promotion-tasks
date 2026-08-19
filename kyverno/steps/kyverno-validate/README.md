@@ -123,9 +123,10 @@ kargo apply -f custom-promotion-step.yaml
 Platform, whose control plane you do not have direct access to, so resources go
 in through the Kargo API.
 
-The manifest points at
-`ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:main`.
-Pin a released tag or a digest before relying on it in production.
+The manifest is pinned to
+`ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:v0.1.0`.
+`:main` tracks every push to the default branch if you would rather follow along,
+and a digest makes it immutable.
 
 `CustomPromotionStep` is cluster-scoped and requires Kargo on the Akuity
 Platform v1.10+, with the Promotion Controller enabled and a self-hosted agent —

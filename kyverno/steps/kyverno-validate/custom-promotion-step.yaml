@@ -13,10 +13,10 @@ kind: CustomPromotionStep
 metadata:
   name: kyverno-validate
 spec:
-  # Published by ../../../.github/workflows/kyverno-validate.yaml. Pin a released
-  # tag (or a digest) for production use, e.g.
-  # ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:v0.1.0
-  image: ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:main
+  # Published by ../../../.github/workflows/kyverno-validate.yaml, which tags a
+  # release from `kyverno-validate/vX.Y.Z`. Pinned deliberately: `:main` tracks
+  # every push. Swap in a digest if you want it immutable.
+  image: ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:v0.1.0
 
   command: ["/usr/local/bin/kyverno-validate"]
 
