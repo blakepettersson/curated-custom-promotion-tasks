@@ -19,7 +19,9 @@ per step beneath it:
 <family>/steps/<step>/src/<step>           entrypoint script (executable, 0755)
 <family>/steps/<step>/custom-promotion-step.yaml
 <family>/steps/<step>/examples/            promotion task + stage
-<family>/steps/<step>/test/run.sh          behaviour tests
+<family>/steps/<step>/test/<step>.bats     behaviour tests (bats)
+<family>/steps/<step>/test/e2e-chart.bats  the family's examples, end to end
+<family>/steps/<step>/test/helpers.bash    run_step + assertions the .bats files load
 <family>/steps/<step>/test/fixtures/
 <family>/examples/                         fixtures a real project would hold
 .github/workflows/<step>.yaml              one workflow per step
@@ -119,21 +121,42 @@ have all caused silent passes here:
 
 ## Testing
 
-`test/run.sh` drives the image exactly as Kargo does — fixtures mounted as the
-working directory, config in the step's config env var, results read back from
-the file named by `$KARGO_OUTPUT` — and asserts on the exit code and that JSON.
-Add a fixture and a case for every behaviour you rely on, and one for every bug
-you fix. A finding without a test will come back.
+Tests are [bats](https://github.com/bats-core/bats-core). `test/helpers.bash`
+holds `run_step`, which drives the image exactly as Kargo does — fixtures
+mounted as the working directory, config in the step's config env var, results
+read back from the file named by `$KARGO_OUTPUT` — plus assertions on the exit
+code and that JSON. `test/<step>.bats` is one `@test` per behaviour. Add a
+fixture and a case for every behaviour you rely on, and one for every bug you
+fix. A finding without a test will come back.
 
-`test/e2e-chart.sh` renders `<family>/examples/` the way the promotion step
-before it would, then validates the output, so the fixtures exercise real
-rendered input rather than hand-written manifests.
+Two things to know about writing the helpers, since bats runs every case under
+`set -e` where a plain script would not:
+
+- A command substitution that legitimately fails — `grep -c` returning 0
+  matches, a `jq` filter erroring on an empty document — aborts the case at the
+  assignment, before your comparison runs, so the failure surfaces with no
+  diagnostics. End those with `|| true`.
+- Capture a step's exit code as `LOG="$(docker run …)" && STATUS=0 || STATUS=$?`.
+  Most cases expect a non-zero exit, and anything less guarded kills the case.
+
+Have each assertion print the exit code, the output JSON and the whole step log
+on failure. bats shows it only for the case that failed, so there is no reason
+to be terse.
+
+`test/e2e-chart.bats` renders `<family>/examples/` the way the promotion step
+before it would, then validates the output, so the cases exercise real rendered
+input rather than hand-written manifests. The render belongs in `setup_file`,
+which runs once for the whole file rather than per case.
+
+Keep it a separate file from the behaviour tests and name both explicitly in the
+`Makefile`: `bats test/` would sweep up the e2e file too, and then `make test`
+needs helm.
 
 From the family directory:
 
 ```console
 make lint    # shellcheck
-make test    # behaviour tests against a locally built image
+make test    # behaviour tests against a locally built image (needs bats)
 make e2e     # example fixtures end to end
 make all
 ```
@@ -161,6 +184,6 @@ name and the tag prefix. Its shape is deliberate:
 2. `docker buildx build --platform linux/amd64,linux/arm64 --output type=cacheonly .`
    in the step directory — arm64 breaks in ways amd64 does not.
 3. After CI publishes, run the suite against the published image:
-   `IMAGE=ghcr.io/<owner>/<repo>/<step>:main ./test/run.sh`. It is the only check
+   `IMAGE=ghcr.io/<owner>/<repo>/<step>:main bats test/`. It is the only check
    that what the registry holds behaves like what you built.
 4. Report what you actually ran. "Tests pass" means you ran them.

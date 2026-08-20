@@ -59,7 +59,15 @@ make all       # lint, build, test, e2e
 make test      # behaviour tests against a locally built image
 ```
 
-`make test` needs docker; `make e2e` also needs helm.
+`make test` needs docker and [bats](https://github.com/bats-core/bats-core);
+`make e2e` also needs helm.
+
+Narrow a run while debugging — each case is a container start, so the whole
+suite is not cheap:
+
+```console
+BATS_ARGS='--filter Audit' make test
+```
 
 ## CI
 

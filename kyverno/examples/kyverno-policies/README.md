@@ -2,7 +2,7 @@
 
 A small Helm chart of Kyverno policies with the manifests to validate against
 them. It stands in for the repository a Kargo project would promote, and it is
-what `../../steps/kyverno-validate/test/e2e-chart.sh` exercises.
+what `../../steps/kyverno-validate/test/e2e-chart.bats` exercises.
 
 ```
 chart/                    Helm chart: the allowed-repos ClusterPolicy, values, prod overlay

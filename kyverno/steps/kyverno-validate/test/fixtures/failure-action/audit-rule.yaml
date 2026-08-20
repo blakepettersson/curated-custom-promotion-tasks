@@ -1,0 +1,22 @@
+# `validate.failureAction: Audit` — the per-rule spelling that replaced
+# `spec.validationFailureAction`. Behaves the same way here: still `fail`.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: audit-rule
+spec:
+  background: true
+  rules:
+    - name: validate-image-repo
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        failureAction: Audit
+        message: "Container image does not match an allowed repository prefix."
+        foreach:
+          - list: "request.object.spec.containers[]"
+            anyPattern:
+              - image: "registry.example.com/*"

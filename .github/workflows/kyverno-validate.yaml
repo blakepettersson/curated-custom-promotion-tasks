@@ -37,7 +37,7 @@ jobs:
       - name: Shellcheck
         run: |
           shellcheck --shell=sh src/kyverno-validate
-          shellcheck test/run.sh test/e2e-chart.sh
+          shellcheck test/helpers.bash test/*.bats
 
   test:
     runs-on: ubuntu-latest
@@ -62,13 +62,24 @@ jobs:
           cache-from: type=gha,scope=kyverno-validate
           cache-to: type=gha,mode=max,scope=kyverno-validate
 
+      # Pinned rather than apt's, which lags. bats is not preinstalled on the
+      # runners.
+      - name: Install bats
+        env:
+          BATS_VERSION: 1.13.0
+        run: |
+          curl -fsSL "https://github.com/bats-core/bats-core/archive/refs/tags/v${BATS_VERSION}.tar.gz" | tar -xz
+          sudo "./bats-core-${BATS_VERSION}/install.sh" /usr/local
+          rm -rf "./bats-core-${BATS_VERSION}"
+          bats --version
+
       - name: Step behaviour tests
-        run: ./test/run.sh
+        run: bats test/kyverno-validate.bats
 
       - uses: azure/setup-helm@v4
 
       - name: Example chart end to end
-        run: ./test/e2e-chart.sh
+        run: bats test/e2e-chart.bats
 
   publish:
     if: github.event_name != 'pull_request'

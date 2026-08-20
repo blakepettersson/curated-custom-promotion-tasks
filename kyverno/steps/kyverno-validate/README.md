@@ -56,7 +56,7 @@ step runs in phases:
 |---|---|---|---|
 | `policies` | string or list | — | **Required.** Files, directories or globs holding Kyverno policies. Directories are searched recursively for `.yaml`, `.yml` and `.json`. |
 | `manifests` | string or list | — | Files, directories or globs holding the manifests to validate against the policies. Omit to only check that the policies themselves are valid. `resources` is accepted as an alias. |
-| `failOn` | string | `fail` | Which policy results fail the step: `fail` (failures and errors), `error` (errors only), `warn` (warnings too), or `none` (report only). |
+| `failOn` | string | `fail` | Which policy results fail the step: `fail` (failures and errors), `error` (errors only), `warn` (warnings too), or `none` (report only). An `Audit`-mode policy still yields `fail` results — see [below](#audit-policies-are-not-advisory-here). |
 | `exceptions` | string or list | — | `PolicyException` manifests to take into account. |
 | `tests` | string or list | — | Directories or files to hand to `kyverno test`. |
 | `valuesFile` | string | — | Kyverno CLI values file, for policies that reference variables. |
@@ -77,6 +77,19 @@ config:
 ```
 
 Files named `kyverno-test.yaml` are never treated as policies.
+
+### `Audit` policies are not advisory here
+
+`spec.validationFailureAction` (policy level) and `validate.failureAction` (per
+rule) decide what an *admission controller* does about a breach in a live cluster.
+They do not change how the CLI reports one: an `Audit` violation comes back as a
+`fail` result, exactly like `Enforce`, and `kyverno apply` exits 1 either way.
+
+So an `Audit` policy will block a promotion under the default `failOn: fail`.
+`failOn` is the only thing that makes a result tolerable — and note that
+`failOn: warn` does *not* help, since it widens what fails rather than narrowing
+it. If your policy set is deliberately advisory, use `failOn: none` and gate on
+the step's output instead — see the example under [Output](#output).
 
 ## Output
 
@@ -158,13 +171,19 @@ From the `kyverno/` directory:
 ```console
 make build          # docker build
 make lint           # shellcheck
-make test           # behaviour tests against the built image
+make test           # behaviour tests against the built image (needs bats)
 make e2e            # renders examples/kyverno-policies and validates it
 ```
 
-The tests drive the image the way Kargo does: fixtures mounted as the working
-directory, config in `KYVERNO_VALIDATE_CONFIG`, results read back from the file
-named by `KARGO_OUTPUT`.
+The tests are [bats](https://github.com/bats-core/bats-core) and drive the image
+the way Kargo does: fixtures mounted as the working directory, config in
+`KYVERNO_VALIDATE_CONFIG`, results read back from the file named by
+`KARGO_OUTPUT`. To run a subset, or to point the suite at a published image:
+
+```console
+bats --filter Audit test/
+IMAGE=ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:v0.1.0 bats test/
+```
 
 To drive it by hand, from this directory:
 
