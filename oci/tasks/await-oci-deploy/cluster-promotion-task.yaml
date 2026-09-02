@@ -1,0 +1,75 @@
+# Waits for something Kargo cannot reach to report that it is running a given
+# artifact digest.
+#
+# For a Stage whose cluster Kargo has no path to — an air-gapped enclave, a
+# customer-managed cluster, anything behind a one-way boundary — so
+# `argocd-update` is not an option. The promotion publishes the artifact, and
+# then blocks here until a status endpoint *both sides can reach outbound*
+# reports the digest live. Neither side has to be reachable: the enclave pushes
+# its status out, Kargo polls the same place.
+#
+# The `http` step is what makes this work. It reports Running and retries
+# whenever neither `successExpression` nor `failureExpression` matches, so the
+# promotion stays open, visible and cancellable while the deploy happens
+# somewhere Kargo cannot see.
+#
+# Register it once per cluster, then reference it from any project's promotion
+# template (see examples/stage.yaml).
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ClusterPromotionTask
+metadata:
+  name: await-oci-deploy
+spec:
+  vars:
+    # Status endpoint to poll. Required. Must be reachable from the Kargo
+    # controller, and must be told the truth by whatever is inside the enclave.
+    - name: statusURL
+    # The digest the endpoint has to report before this promotion succeeds.
+    # Defaults to what publish-manifests-to-oci recorded on the Freight.
+    - name: digest
+      value: ${{ freightMetadata(ctx.targetFreight.name)?.ociManifests?.digest }}
+    # The JSON field of the response carrying the digest currently deployed.
+    # The default expects a body of the shape {"revision": "sha256:..."}, the
+    # smallest thing worth publishing.
+    - name: revisionField
+      value: revision
+
+  steps:
+    # `successExpression` is evaluated with only `response` in scope — no
+    # `vars`, no `ctx` — so the digest is interpolated into the expression's
+    # text here, by the config templating, rather than referenced from within
+    # it.
+    #
+    # It compares digests rather than merely checking for a healthy status. A
+    # bare status check succeeds against whatever the enclave was already
+    # running, so the first poll would report a rollout that has not happened.
+    #
+    # A 404 before anything has reported is neither success nor failure: it
+    # falls through to Running and is retried, which is why the failure
+    # expression excludes it.
+    #
+    # `retry.timeout` is the real deadline. It is a typed duration on the step
+    # rather than part of `config`, so it cannot be driven by a var — an enclave
+    # with a different patience needs its own copy of this task.
+    - uses: http
+      as: await
+      config:
+        method: GET
+        url: ${{ vars.statusURL }}
+        pollInterval: 30s
+        successExpression: response.status == 200 && response.body.${{ vars.revisionField }} == "${{ vars.digest }}"
+        failureExpression: response.status >= 400 && response.status != 404
+        outputs:
+          - name: revision
+            fromExpression: response.body.${{ vars.revisionField }}
+          - name: status
+            fromExpression: response.status
+      retry:
+        timeout: 1h
+
+    - uses: compose-output
+      as: output
+      config:
+        revision: ${{ task.outputs.await.revision }}
+        status: ${{ task.outputs.await.status }}
+        statusURL: ${{ vars.statusURL }}

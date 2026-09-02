@@ -1,0 +1,31 @@
+# The Argo CD Applications for a pipeline that hydrates once. All of them point
+# at the same OCI repository and are moved to the same digest; `path` is the
+# only thing that differs, and it is what makes one artifact serve every Stage.
+#
+# `path` is set here, once, and never by a promotion: `argocd-update` has no
+# `path` field, because which subdirectory an environment reads is a property of
+# the environment and not of the release flowing through it.
+#
+# `targetRevision` below is a starting point only. Every promotion rewrites it
+# to the digest it deployed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: example-app-prod
+  namespace: argocd
+  annotations:
+    kargo.akuity.io/authorized-stage: example-app:prod
+spec:
+  project: default
+  source:
+    repoURL: oci://ghcr.io/example/config/example-app
+    targetRevision: test
+    # The subdirectory this Stage's manifests were rendered into. A pipeline
+    # whose artifact holds a single Stage's manifests at the root uses `.`.
+    path: prod
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: example-app-prod
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

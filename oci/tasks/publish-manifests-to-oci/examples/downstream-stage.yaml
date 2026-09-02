@@ -1,0 +1,38 @@
+# A Stage downstream of the one that hydrated for the whole pipeline.
+#
+# It renders nothing, clones nothing and needs no Warehouse of its own: its
+# Freight is the same Freight the entry Stage promoted, and the artifact digest
+# is recorded on it. The whole promotion is one step.
+#
+# This is what "hydrate once" buys. A promotion here needs network access to the
+# registry and to Argo CD, and to nothing else — no Git, no chart repositories,
+# no Helm. That is also precisely what makes an air-gapped Stage tractable; see
+# the family README.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: prod
+  namespace: example-app
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        stages:
+          - test
+
+  promotionTemplate:
+    spec:
+      steps:
+        # `revision` is not set: it defaults to the digest
+        # publish-manifests-to-oci recorded on this Freight.
+        - task:
+            name: deploy-oci-to-argocd
+            kind: ClusterPromotionTask
+          as: deploy
+          vars:
+            - name: ociRepo
+              value: ghcr.io/example/config/example-app
+            - name: appName
+              value: example-app-${{ ctx.stage }}

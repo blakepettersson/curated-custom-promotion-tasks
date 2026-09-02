@@ -316,6 +316,56 @@ def collect_refs(node, patterns, found):
             collect_refs(value, patterns, found)
 
 
+# The keys a PromotionStep may carry, from api/v1alpha1/promotion_types.go.
+# Only `config` is checked against a schema, so without this a misspelled
+# step-level key is silently ignored by everything until it matters.
+STEP_KEYS = {"uses", "task", "as", "if", "continueOnError", "retry", "vars", "config"}
+
+# A Go duration, which is what metav1.Duration parses.
+DURATION = re.compile(r"^(\d+(ns|us|µs|ms|s|m|h))+$")
+
+
+def check_retry(retry, where, at, findings):
+    """Checks a step's retry block.
+
+    `retry` is a typed field on the step rather than part of `config`, so it is
+    not expression-templated: `timeout: ${{ vars.timeout }}` does not fail as a
+    bad expression, it fails as a duration that will not parse. Nothing else
+    here would notice, since only `config` is schema-checked.
+    """
+    if retry is None:
+        return
+    if not isinstance(retry, dict):
+        findings.add(where, f"{at}: `retry` must be an object")
+        return
+    for key in retry:
+        if key not in ("timeout", "errorThreshold"):
+            findings.add(
+                where,
+                f"{at}: unknown retry key {key!r} (retry may have: errorThreshold, timeout)",
+            )
+    timeout = retry.get("timeout")
+    if timeout is not None:
+        if is_expr(timeout):
+            findings.add(
+                where,
+                f"{at}: retry.timeout is a typed duration, not part of `config`, so it "
+                "is never expression-templated. Use a literal such as 1h",
+            )
+        elif not isinstance(timeout, str) or not DURATION.match(timeout):
+            findings.add(
+                where,
+                f"{at}: retry.timeout {timeout!r} is not a Go duration (e.g. 30s, 1h)",
+            )
+    threshold = retry.get("errorThreshold")
+    if threshold is not None and (
+        isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0
+    ):
+        findings.add(
+            where, f"{at}: retry.errorThreshold {threshold!r} must be a non-negative integer"
+        )
+
+
 # The layer media type oci-push applies when none is configured.
 DEFAULT_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar+gzip"
 
@@ -416,6 +466,15 @@ def lint(task, where, schemas, findings):
                 f"{at}: a task step cannot reference another task — Kargo validates "
                 "PromotionTask steps as `has(self.uses) && !has(self.task)`",
             )
+        for key in step:
+            if key not in STEP_KEYS:
+                findings.add(
+                    where,
+                    f"{at}: unknown step key {key!r} "
+                    f"(a step may have: {', '.join(sorted(STEP_KEYS))})",
+                )
+        check_retry(step.get("retry"), where, at, findings)
+
         uses = step.get("uses")
         if not uses:
             findings.add(where, f"{at}: `uses` is required")

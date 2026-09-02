@@ -18,13 +18,13 @@ setup() {
 
 # --------------------------------------------------------------- the real tasks
 
-@test 'hydrate-helm-to-oci lints clean' {
-  lint_task "$TASKS_DIR/hydrate-helm-to-oci/cluster-promotion-task.yaml"
+@test 'publish-manifests-to-oci lints clean' {
+  lint_task "$TASKS_DIR/publish-manifests-to-oci/cluster-promotion-task.yaml"
   assert_lint_clean
 }
 
-@test 'hydrate-kustomize-to-oci lints clean' {
-  lint_task "$TASKS_DIR/hydrate-kustomize-to-oci/cluster-promotion-task.yaml"
+@test 'await-oci-deploy lints clean' {
+  lint_task "$TASKS_DIR/await-oci-deploy/cluster-promotion-task.yaml"
   assert_lint_clean
 }
 
@@ -48,28 +48,34 @@ setup() {
 }
 
 # The trap this whole family is built around: `tar` defaults to no compression
-# while `oci-push` defaults its layer media type to `...tar+gzip`. Assert the
-# hydrate tasks stay on the compressed side of it, since the linter's coherence
-# check only proves the two agree — not that they agree on gzip, which is what
-# Argo CD's allow-list requires.
-@test 'the hydrate tasks archive with gzip and publish an Argo CD readable layer type' {
-  local task
-  for task in hydrate-helm-to-oci hydrate-kustomize-to-oci; do
-    local yaml="$TASKS_DIR/$task/cluster-promotion-task.yaml"
-    CONTEXT="$task"
-
-    local gzip
+# while `oci-push` defaults its layer media type to `...tar+gzip`. Assert every
+# task that publishes an archive stays on the compressed side of it, since the
+# linter's coherence check only proves the two agree — not that they agree on
+# gzip, which is what Argo CD's allow-list requires.
+#
+# Discovered rather than listed, so a task added later is covered without this
+# case being touched.
+@test 'every task that publishes an archive gzips it and uses an Argo CD readable layer type' {
+  local checked=0 yaml
+  while IFS= read -r yaml; do
+    CONTEXT="$yaml"
+    local gzip media_type
     gzip="$(q "$yaml" '[.spec.steps[] | select(.uses == "tar")] | .[0].config.gzip')"
-    assert_equal "$gzip" "true" "$task: the tar step's gzip"
+    assert_equal "$gzip" "true" "$(basename "$(dirname "$yaml")"): the tar step's gzip" || return 1
 
     # An unset mediaType means oci-push's default, which is the gzipped OCI
     # layer type. If a task ever sets one explicitly it has to stay inside Argo
     # CD's allow-list.
-    local media_type
     media_type="$(q "$yaml" \
-      '[.spec.steps[] | select(.uses == "oci-push" and has("config") and (.config | has("srcPath")))] | .[0].config.mediaType // "application/vnd.oci.image.layer.v1.tar+gzip"')"
-    assert_argocd_readable_layer_type "$media_type"
-  done
+      '[.spec.steps[] | select(.uses == "oci-push" and (.config | has("srcPath")))] | .[0].config.mediaType // "application/vnd.oci.image.layer.v1.tar+gzip"')"
+    assert_argocd_readable_layer_type "$media_type" || return 1
+    checked=$((checked + 1))
+  done < <(archive_publishing_tasks)
+
+  [ "$checked" -ge 1 ] || {
+    printf 'assertion failed: found no archive-publishing task to check\n'
+    return 1
+  }
 }
 
 # The second push has to be a retag of the first push's digest rather than a
@@ -77,27 +83,25 @@ setup() {
 # srcPath push is byte-identical only for as long as every annotation stays so,
 # and a digest that quietly diverges from the immutable tag is the one bug this
 # design exists to prevent.
-@test 'the hydrate tasks apply the mutable tag by retagging the pushed digest' {
-  local task
-  for task in hydrate-helm-to-oci hydrate-kustomize-to-oci; do
-    local yaml="$TASKS_DIR/$task/cluster-promotion-task.yaml"
-    CONTEXT="$task"
-
-    local src_ref dest_ref
+@test 'every task that publishes an archive applies its mutable tag by retagging' {
+  local yaml
+  while IFS= read -r yaml; do
+    CONTEXT="$yaml"
+    local name src_ref dest_ref push_repo retag_repo
+    name="$(basename "$(dirname "$yaml")")"
     src_ref="$(q "$yaml" '.spec.steps[] | select(.as == "retag") | .config.srcRef')"
     dest_ref="$(q "$yaml" '.spec.steps[] | select(.as == "retag") | .config.destRef')"
     assert_equal "$src_ref" '${{ vars.ociRepo }}@${{ task.outputs.push.digest }}' \
-      "$task: the retag step's srcRef"
+      "$name: the retag step's srcRef" || return 1
     assert_equal "$dest_ref" '${{ vars.ociRepo }}:${{ vars.mutableTag }}' \
-      "$task: the retag step's destRef"
+      "$name: the retag step's destRef" || return 1
 
     # A retag across repositories would transfer blobs and be subject to the
     # artifact size limit; within one repository it is metadata only.
-    local push_repo retag_repo
     push_repo="${dest_ref%%:*}"
     retag_repo="${src_ref%%@*}"
-    assert_equal "$retag_repo" "$push_repo" "$task: the retag must stay in one repository"
-  done
+    assert_equal "$retag_repo" "$push_repo" "$name: the retag must stay in one repository" || return 1
+  done < <(archive_publishing_tasks)
 }
 
 # ------------------------------------------------------------- stage examples
@@ -129,7 +133,7 @@ setup() {
       assert_subset "$BATS_TEST_TMPDIR/required" "$BATS_TEST_TMPDIR/passed" \
         "omits a var $name requires of its caller (it has no default)" || return 1
     done
-  done < <(find "$TASKS_DIR" -path '*/examples/stage.yaml' | sort)
+  done < <(find "$TASKS_DIR" -path '*/examples/*stage.yaml' | sort)
 }
 
 # A stage example must use `outputs.<alias>`, never `task.outputs.<alias>`:
@@ -236,14 +240,47 @@ setup() {
   assert_lint_reports 'uncompressed tar labelled as gzip'
 }
 
+# `retry` is a typed field on the step, not part of `config`, so it is never
+# expression-templated and only the linter's own check covers it. The three
+# cases below are the reason it has one.
+@test 'an expression in retry.timeout is rejected' {
+  lint_task "$FIXTURES_DIR/broken/retry-expression.yaml"
+  assert_lint_fails
+  assert_lint_reports 'never expression-templated'
+}
+
+@test 'a retry.timeout that is not a Go duration is rejected' {
+  lint_task "$FIXTURES_DIR/broken/retry-duration.yaml"
+  assert_lint_fails
+  assert_lint_reports 'is not a Go duration'
+}
+
+@test 'a misspelled step-level key is rejected' {
+  lint_task "$FIXTURES_DIR/broken/unknown-step-key.yaml"
+  assert_lint_fails
+  assert_lint_reports "unknown step key 'retires'"
+}
+
+# The counterpart: a legal retry block must still be accepted, or the checks
+# above would just be banning retry.
+@test 'a literal retry.timeout is accepted' {
+  lint_task "$TASKS_DIR/await-oci-deploy/cluster-promotion-task.yaml"
+  assert_lint_clean
+  q "$TASKS_DIR/await-oci-deploy/cluster-promotion-task.yaml" \
+    '[.spec.steps[] | select(.retry != null)] | length' | grep -qv '^0$' || {
+    printf 'assertion failed: await-oci-deploy no longer sets retry, so this case proves nothing\n'
+    return 1
+  }
+}
+
 # A whole-value expression must still be accepted in a boolean field, or the
 # check above would just be banning expressions.
 @test 'a whole-value expression in a boolean field is accepted' {
-  lint_task "$TASKS_DIR/hydrate-helm-to-oci/cluster-promotion-task.yaml"
+  local yaml="$TASKS_DIR/deploy-oci-to-argocd/cluster-promotion-task.yaml"
+  lint_task "$yaml"
   assert_lint_clean
-  grep -q 'includeCRDs: ${{ vars.includeCRDs }}' \
-    "$TASKS_DIR/hydrate-helm-to-oci/cluster-promotion-task.yaml" || {
-    printf 'assertion failed: hydrate-helm-to-oci no longer drives a boolean field from a var, so this case proves nothing\n'
+  grep -q 'updateTargetRevision: ${{ vars.updateTargetRevision }}' "$yaml" || {
+    printf 'assertion failed: deploy-oci-to-argocd no longer drives a boolean field from a var, so this case proves nothing\n'
     return 1
   }
 }

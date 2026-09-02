@@ -1,0 +1,118 @@
+# The entry Stage of a pipeline that hydrates once for every Stage.
+#
+# It renders each Stage's manifests into its own subdirectory and publishes all
+# of them as ONE artifact with one digest. Every Stage downstream then deploys
+# that same digest, with its Argo CD Application's `path` selecting its own
+# subdirectory. Nothing downstream renders anything, so nothing downstream can
+# disagree with what was tested here.
+#
+# The render loop is written out rather than parameterised: a promotion's steps
+# are static, so there is no way to iterate a list of Stages. Writing them out
+# is the cost of the guarantee, and adding a Stage means adding a step here.
+#
+# For a Stage that renders only itself, see single-stage.yaml — the same shape
+# with one render step instead of three.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: test
+  namespace: example-app
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        direct: true
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: repoURL
+          value: https://github.com/example/example-app.git
+        - name: ociRepo
+          value: ghcr.io/example/config/example-app
+        - name: chartPath
+          value: chart
+
+      steps:
+        # One clone, pinned to the commit in the Freight, shared by every render
+        # below. Every Stage's manifests therefore come from the same commit.
+        - uses: git-clone
+          as: clone
+          config:
+            repoURL: ${{ vars.repoURL }}
+            checkout:
+              - commit: ${{ commitFrom(vars.repoURL).ID }}
+                path: ./src
+
+        # One helm-template per Stage, each into ./manifests/<stage>. The
+        # values file is the Stage's own, so the artifact holds a correctly
+        # rendered copy for each Stage rather than one generic copy.
+        - uses: helm-template
+          as: render-test
+          config:
+            path: ./src/${{ vars.chartPath }}
+            releaseName: example-app
+            namespace: example-app-test
+            outPath: ./manifests/test
+            outLayout: flat
+            includeCRDs: true
+            valuesFiles:
+              - ./src/${{ vars.chartPath }}/values.yaml
+              - ./src/${{ vars.chartPath }}/values-test.yaml
+            ignoreMissingValueFiles: true
+
+        - uses: helm-template
+          as: render-stage
+          config:
+            path: ./src/${{ vars.chartPath }}
+            releaseName: example-app
+            namespace: example-app-stage
+            outPath: ./manifests/stage
+            outLayout: flat
+            includeCRDs: true
+            valuesFiles:
+              - ./src/${{ vars.chartPath }}/values.yaml
+              - ./src/${{ vars.chartPath }}/values-stage.yaml
+            ignoreMissingValueFiles: true
+
+        - uses: helm-template
+          as: render-prod
+          config:
+            path: ./src/${{ vars.chartPath }}
+            releaseName: example-app
+            namespace: example-app-prod
+            outPath: ./manifests/prod
+            outLayout: flat
+            includeCRDs: true
+            valuesFiles:
+              - ./src/${{ vars.chartPath }}/values.yaml
+              - ./src/${{ vars.chartPath }}/values-prod.yaml
+            ignoreMissingValueFiles: true
+
+        # One archive, one push, one digest — and the digest recorded on the
+        # Freight, which is how the Stages downstream find it.
+        - task:
+            name: publish-manifests-to-oci
+            kind: ClusterPromotionTask
+          as: publish
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+            - name: repoURL
+              value: ${{ vars.repoURL }}
+
+        # This Stage deploys too, reading its own subdirectory. Its Application
+        # has `path: test`.
+        - task:
+            name: deploy-oci-to-argocd
+            kind: ClusterPromotionTask
+          as: deploy
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+            - name: revision
+              value: ${{ outputs.publish.digest }}
+            - name: appName
+              value: example-app-${{ ctx.stage }}

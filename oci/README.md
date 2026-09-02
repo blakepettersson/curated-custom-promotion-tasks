@@ -24,9 +24,24 @@ For the Argo CD side you need Argo CD with OCI source support, and an
 
 | Task | What it does |
 |---|---|
-| [`hydrate-helm-to-oci`](tasks/hydrate-helm-to-oci) | Renders a Helm chart from Git and publishes the manifests as an OCI artifact. |
-| [`hydrate-kustomize-to-oci`](tasks/hydrate-kustomize-to-oci) | Builds a Kustomize overlay from Git and publishes the manifests as an OCI artifact. |
+| [`publish-manifests-to-oci`](tasks/publish-manifests-to-oci) | Packages a directory of rendered manifests, publishes it as an OCI artifact, and records the digest on the Freight. |
 | [`deploy-oci-to-argocd`](tasks/deploy-oci-to-argocd) | Points an Argo CD Application's OCI source at a digest and waits for it to sync. |
+| [`await-oci-deploy`](tasks/await-oci-deploy) | Waits for a cluster Kargo cannot reach to report that it is running a digest. |
+
+## Rendering is yours
+
+There is no "clone, render and push" task here, and that is a decision rather
+than a gap. An all-in-one task can only render **one** Stage: a promotion's
+steps are static, Kargo has no loop construct, and a `stages: [...]` var
+therefore cannot drive N renders. Since rendering every Stage at once is the
+shape worth having, the publish half has to stand alone — so it does, once, and
+the render steps are Kargo's own `helm-template` and `kustomize-build`, written
+out in the promotion template.
+
+The cost is a few more lines in the promotion template. What it buys is one way
+to do this instead of two, no all-in-one variant per renderer, and — because a
+task cannot call another task — no duplicated archive/push/retag tail to keep in
+agreement across three copies.
 
 ## Why hydrate to OCI
 
@@ -52,41 +67,251 @@ is cluster-scoped and goes in through the Kargo API:
 
 ```console
 kargo login https://<your-kargo-instance>
-kargo apply -f tasks/hydrate-helm-to-oci/cluster-promotion-task.yaml
-kargo apply -f tasks/hydrate-kustomize-to-oci/cluster-promotion-task.yaml
+kargo apply -f tasks/publish-manifests-to-oci/cluster-promotion-task.yaml
 kargo apply -f tasks/deploy-oci-to-argocd/cluster-promotion-task.yaml
+kargo apply -f tasks/await-oci-deploy/cluster-promotion-task.yaml
 ```
 
-Then reference one from a promotion template:
+Then render, publish and deploy from a promotion template. The render steps are
+Kargo's own; the tasks are the two either side of them:
 
 ```yaml
 steps:
+  - uses: git-clone
+    as: clone
+    config:
+      repoURL: ${{ vars.repoURL }}
+      checkout:
+        - commit: ${{ commitFrom(vars.repoURL).ID }}
+          path: ./src
+
+  - uses: helm-template
+    as: render
+    config:
+      path: ./src/chart
+      releaseName: example-app
+      outPath: ./manifests
+      outLayout: flat
+      includeCRDs: true
+
   - task:
-      name: hydrate-helm-to-oci
+      name: publish-manifests-to-oci
       kind: ClusterPromotionTask
-    as: hydrate
+    as: publish
     vars:
       - name: repoURL
-        value: https://github.com/example/example-app.git
+        value: ${{ vars.repoURL }}
       - name: ociRepo
         value: ghcr.io/example/config/example-app
+
+  - task:
+      name: deploy-oci-to-argocd
+      kind: ClusterPromotionTask
+    as: deploy
+    vars:
+      - name: ociRepo
+        value: ghcr.io/example/config/example-app
+      - name: revision
+        value: ${{ outputs.publish.digest }}
+      - name: appName
+        value: example-app-${{ ctx.stage }}
 ```
 
-Each task's README lists its vars and outputs; each has an `examples/` directory
-with a working `Stage`, `Warehouse` and — for the deploy task — the Argo CD
-`Application` the task expects.
+Each task's README lists its vars and outputs;
+[`tasks/publish-manifests-to-oci/examples/`](tasks/publish-manifests-to-oci/examples/)
+has runnable `Stage`, `Warehouse` and Argo CD `Application` manifests for every
+shape below.
 
-## Two shapes to choose between
+Which tasks you need depends on the shape you pick, which is the next section.
 
-**Hydrate and deploy in one promotion.** Every Stage renders its own manifests
-and syncs its own Application. This is the simpler shape and where to start; see
-[`tasks/hydrate-helm-to-oci/examples/stage.yaml`](tasks/hydrate-helm-to-oci/examples/stage.yaml).
+## Multiple Stages: render per Stage, or once for all of them?
 
-**Hydrate once, deploy many times.** One Stage renders and publishes; downstream
-Stages have a `Warehouse` subscribed to the artifact and promote the *rendered
-output* rather than re-rendering it. Downstream can then never disagree with
-what was tested, because it is deploying the identical bytes. See
-[`tasks/deploy-oci-to-argocd/examples/`](tasks/deploy-oci-to-argocd/examples/).
+Both work, and they differ in one thing that matters. **Prefer rendering once
+for every Stage** unless the pipeline is small enough that you would rather have
+the simpler promotion template.
+
+Both shapes use the same task. They differ only in how many render steps the
+promotion template has, and in which Stage runs them.
+
+### Render per Stage
+
+Each Stage's promotion clones, renders with its own values file or overlay, and
+publishes its own artifact under its own tag —
+[`examples/single-stage.yaml`](tasks/publish-manifests-to-oci/examples/single-stage.yaml).
+
+```
+test  ──clone, render, push──▶  :test   ──▶ Application(path: .)
+stage ──clone, render, push──▶  :stage  ──▶ Application(path: .)
+prod  ──clone, render, push──▶  :prod   ──▶ Application(path: .)
+```
+
+This is not as weak as it first looks: the Freight pins the commit, so prod
+renders from *the same commit* test did, not from whatever `main` says at prod
+promotion time. It is reproducible.
+
+What it does not give you is identity. Prod's manifests are a **re-render**, and
+a re-render is only as trustworthy as its inputs are pinned — the chart's
+dependencies, the Helm version in the promotion pod, a `values-prod.yaml` that
+nobody validated because no Stage before prod reads it. Prod's render also
+happens for the first time during prod's promotion, so a template error in the
+prod path surfaces there and nowhere earlier.
+
+Use this shape when a pipeline has one or two Stages, or when Stages differ so
+much that a shared render is meaningless.
+
+### Render once for every Stage
+
+The entry Stage renders *every* Stage, each into its own subdirectory, and
+publishes all of them as **one artifact with one digest**. Each Stage's Argo CD
+Application selects its own subdirectory with `path`.
+
+```
+test ──clone, render ×3, push──▶  :test ── one digest ──┬──▶ Application(path: test)
+                                                        ├──▶ Application(path: stage)
+                                                        └──▶ Application(path: prod)
+```
+
+- **Prod deploys bytes, not a promise.** The manifests prod applies are the ones
+  produced when the Freight entered the pipeline, byte for byte. There is no
+  re-render to disagree.
+- **Every Stage's render is exercised on the first promotion.** A broken
+  `values-prod.yaml` fails at the entry Stage, not at 2am during the prod
+  promotion.
+- **Downstream promotions need almost nothing.** No Git, no Helm, no Kustomize,
+  no chart repositories — a downstream promotion talks to the registry and to
+  Argo CD and to nothing else. This is what makes an air-gapped Stage tractable
+  at all, and it is the main reason to prefer this shape.
+- **One thing to promote, inspect, mirror and roll back.** One digest, not one
+  per Stage.
+
+The costs are real and worth stating:
+
+- **The render loop is written out, not parameterised.** A promotion's steps are
+  static, so there is no way to iterate a list of Stages. Adding a Stage means
+  adding a `helm-template` step to the entry Stage's promotion template.
+- **A config change only takes effect on re-entry.** Editing `values-prod.yaml`
+  changes nothing until new Freight passes through the entry Stage. That is
+  arguably the correct behaviour — config changes flow through the pipeline like
+  everything else, and get whatever verification the earlier Stages provide —
+  but it does surprise people who expect to edit prod's values and promote.
+- **Every Stage's manifests are in every Stage's artifact.** Harmless (Argo CD
+  reads only its `path`) and negligible in size, but it is not a secrets
+  boundary. Rendered manifests are not a place for secrets in either shape.
+
+See [`examples/entry-stage.yaml`](tasks/publish-manifests-to-oci/examples/entry-stage.yaml)
+for the entry Stage, [`examples/downstream-stage.yaml`](tasks/publish-manifests-to-oci/examples/downstream-stage.yaml)
+for a downstream Stage whose whole promotion is one step, and
+[`examples/entry-stage-kustomize.yaml`](tasks/publish-manifests-to-oci/examples/entry-stage-kustomize.yaml)
+for the same with Kustomize.
+
+### Not worth building: one artifact for all Stages with no per-Stage rendering
+
+The tempting third option is to render once, stage-agnostically, and let each
+environment differ some other way. It needs the manifests to carry no per-Stage
+difference at all, which is almost never true of a real chart — replicas,
+hostnames, resource limits, namespaces. Reach for it only if you already run
+that way deliberately.
+
+## How a downstream Stage learns the digest
+
+Two mechanisms, for two topologies. This is worth getting right, because they
+have different consequences for Freight lineage.
+
+**Freight metadata — within one pipeline.** `publish-manifests-to-oci` records
+`ociManifests.{repo,digest,tag}` on the Freight with `set-metadata`, and
+`deploy-oci-to-argocd` reads it back with `freightMetadata()` by default. **One**
+Freight then flows through the whole pipeline: prod is promoting the same
+Freight — the same commit, the same image digests, the same verification history
+— and the manifests are a property of it. Nothing new is created and no second
+Warehouse exists.
+
+**A Warehouse on the registry — across a boundary.** A Stage subscribes to the
+OCI repository and its Freight *is* the artifact. This is the only shape that
+works when Freight metadata cannot travel: a separate Kargo project, a separate
+Kargo instance, an air-gapped enclave. The cost is lineage — the new Freight is
+"manifests digest X", and the commit and image digests that produced it are no
+longer in it. Kargo's `imageFrom()` on the artifact repository gives you a
+digest and nothing about its provenance, which is why the hydrate tasks stamp
+`org.opencontainers.image.revision` onto the artifact itself: with a Warehouse
+boundary, the OCI annotations are the only way back to the source.
+
+So: within a pipeline, metadata. Across a boundary, a Warehouse — and design the
+boundary knowing that Freight identity stops there.
+
+`deploy-oci-to-argocd`'s default `revision` tries metadata first and falls back
+to `imageFrom()`, so both shapes work without configuring anything.
+
+## Air-gapped Stages
+
+The artifact is the interface. That is the whole answer, and everything below is
+about how much of a control loop you can get back on top of it.
+
+Design the boundary so that **only the artifact crosses it** — which is exactly
+what "render once for every Stage" buys, since a downstream promotion then needs
+no Git, no chart repository and no Helm. Mirror by digest, never by tag, so what
+lands inside cannot depend on when the mirror ran. Three tiers, in order of
+preference:
+
+### 1. A Kargo controller shard inside the enclave
+
+If the enclave can open an **outbound** connection to the Kargo control plane,
+run a controller shard in there and put the Stage on it. The shard pulls its
+work, runs `deploy-oci-to-argocd` against the enclave's own Argo CD, and reports
+status back out. Nothing needs to accept inbound connections, and you keep the
+whole control loop: real health checks, real sync waits, real failures with
+causes.
+
+This is the shape to push for. It is a networking conversation, not an
+architecture change — the tasks are unchanged, and the only extra moving part is
+mirroring the artifact into a registry the enclave can read.
+
+### 2. No Kargo inside, but a shared status endpoint
+
+If nothing inside can run a controller but *something* inside can make outbound
+HTTP calls, use [`await-oci-deploy`](tasks/await-oci-deploy). The promotion
+mirrors the artifact by digest and then polls a status endpoint until it reports
+that digest live. Both sides reach the endpoint outbound; neither accepts
+inbound.
+
+This is the webhook idea, inverted into a poll — which is strictly better here,
+because an inbound webhook would require *Kargo* to be reachable, and that is
+the assumption an air-gapped enclave is least likely to grant. Kargo's `http`
+step reports Running and retries whenever neither the success nor the failure
+expression matches, so the promotion stays open and visible while the rollout
+happens somewhere Kargo cannot see.
+
+Two things to get right, both covered in
+[the endpoint contract](tasks/await-oci-deploy/examples/status-contract.md):
+
+- **Compare digests, not health.** The endpoint is normally reporting the
+  *previous* digest when polling starts, so a bare health check succeeds on the
+  first poll and reports a rollout that has not happened.
+- **Report what is running, read back from the cluster** — not what the enclave
+  was told to deploy. Otherwise the gate confirms only that the mirror step ran,
+  which the mirror step already confirmed.
+
+Be honest about what you have: a gate, not a deploy. Nothing in the promotion
+causes the rollout, so an enclave that never rolls out yields a timeout rather
+than a failure with a cause.
+
+### 3. Genuinely no path in either direction
+
+Then you are, as you'd expect, out of luck for a control loop — and the mistake
+is to model the enclave as a Kargo Stage anyway. A Stage that cannot observe its
+own outcome reports success for having *published*, which is worse than not
+modelling it: the pipeline shows green for a deploy nobody has confirmed.
+
+Instead, end the outer pipeline at the boundary. Its last Stage publishes the
+artifact, and its success means "this digest is released and mirrored", which is
+true and useful. Inside the enclave, run a second, self-contained Kargo with a
+`Warehouse` subscribed to the inner registry — it discovers artifacts as they
+arrive, and promotes them through inner Stages with a full control loop, because
+everything it needs is inside. The two pipelines are joined only by the artifact
+and never talk.
+
+That is the same boundary as tier 1 or 2, drawn honestly: the artifact carries
+the release, the OCI annotations carry the provenance, and neither pipeline
+pretends to know the other's state.
 
 ## What these tasks get right, and why it is not obvious
 
@@ -97,7 +322,8 @@ wrong thing. All of them are checked by the suites in [`test/`](test).
 `application/vnd.oci.image.layer.v1.tar+gzip`.** Omit `gzip: true` and you
 publish a plain tar labelled as gzip. Both steps succeed, the registry accepts
 it without complaint, and Argo CD's repo-server then fails to decompress the
-layer. `test/lint-task.py` refuses a task whose archive and media type disagree.
+layer. `test/lint-task.py` refuses a task whose archive and media type disagree, and
+`test/e2e-recipe.bats` asserts the published bytes really are gzip.
 
 **Argo CD reads only three layer media types by default** —
 `application/vnd.oci.image.layer.v1.tar`, the `+gzip` form of it, and
@@ -126,9 +352,30 @@ Kargo replaces a whole-value expression with the expression's typed result.
 
 **Tasks do not nest.** Kargo validates a `PromotionTask` step as
 `has(self.uses) && !has(self.task)`, so hydrate-then-deploy is two task
-references in the calling Stage, not one task calling another.
+references in the calling Stage, not one task calling another. It is also why
+there is one publishing task rather than one per renderer: every all-in-one
+variant would carry its own copy of the archive/push/retag tail, with nothing
+but a test able to hold the copies in agreement.
+
+**`argocd-update` cannot set a source's `path`.** Its source update accepts
+`repoURL`, `chart`, `desiredRevision`, `updateTargetRevision`, `helm` and
+`kustomize`, and nothing else. So `path` is set on the `Application` once, per
+environment — which is right: which subdirectory an environment reads is a
+property of that environment, not of the release flowing through it.
+
+**A step's `retry` block is never expression-templated.** Only `config` is.
+`retry.timeout` is a typed `metav1.Duration`, so `${{ vars.timeout }}` there
+fails as a duration that will not parse, and nothing but the linter would notice.
+
+**`successExpression` in the `http` step sees only `response`.** No `vars`, no
+`ctx`. A value from a var has to be interpolated into the expression's *text* by
+the config templating, not referenced from inside it.
 
 ## Subscribing to hydrated manifests
+
+For when a `Warehouse` is the right way to carry the artifact across a boundary
+— see [How a downstream Stage learns the digest](#how-a-downstream-stage-learns-the-digest)
+for when it is and is not.
 
 There is no OCI-artifact subscription type; an `image` subscription is what
 watches these artifacts, and it works because `oci-push` writes an

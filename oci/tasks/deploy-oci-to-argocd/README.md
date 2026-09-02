@@ -7,12 +7,14 @@ waits for it to sync.
 argocd-update → compose-output
 ```
 
-Two callers, one task:
+Three callers, one task:
 
-- **A downstream Stage whose Warehouse subscribes to the OCI repository.** The
-  default `revision` reads the digest straight out of the Freight, so the Stage
-  sets nothing but `ociRepo` and `appName`. This is the "hydrate once, deploy
-  many times" shape.
+- **A Stage downstream of one that hydrated for the whole pipeline.** The
+  default `revision` reads the digest that
+  [`publish-manifests-to-oci`](../publish-manifests-to-oci) recorded on the
+  Freight, so the Stage sets nothing but `ociRepo` and `appName`.
+- **A Stage whose Warehouse subscribes to the OCI repository.** The default
+  falls through to the digest of the artifact in the Freight itself.
 - **The Stage that just hydrated the artifact.** Override `revision` with the
   hydrate task's `digest` output.
 
@@ -21,7 +23,7 @@ Two callers, one task:
 | Var | Default | Description |
 |---|---|---|
 | `ociRepo` | *required* | OCI repository holding the artifact, without a tag or digest. Must match the Application source's `repoURL` less its `oci://` prefix. |
-| `revision` | `${{ imageFrom(vars.ociRepo).Digest }}` | The artifact to sync to, as a digest. |
+| `revision` | see below | The artifact to sync to, as a digest. |
 | `appName` | `${{ ctx.project }}-${{ ctx.stage }}` | Name of the Argo CD Application to update. |
 | `appNamespace` | `argocd` | Namespace the Application lives in. |
 | `updateTargetRevision` | `true` | Whether to rewrite the source's `targetRevision` to the digest, pinning the Application to exactly this artifact. |
@@ -34,6 +36,33 @@ Two callers, one task:
 | `revision` | The digest that was deployed. |
 | `app` | The Application that was updated. |
 | `appNamespace` | Its namespace. |
+
+## Where `revision` comes from
+
+The default covers the first two callers above, in order:
+
+```
+${{ freightMetadata(ctx.targetFreight.name)?.ociManifests?.digest
+    ?? imageFrom(vars.ociRepo).Digest }}
+```
+
+Freight metadata first — one Freight flowing through the pipeline, the manifests
+a property of it. Failing that, the artifact in the Freight — which is the shape
+that works across a boundary metadata cannot cross. The family README explains
+[the trade-off between them](../../README.md#how-a-downstream-stage-learns-the-digest).
+
+## The Application's `path` is not this task's business
+
+`argocd-update` has no `path` field, so this task never sets one. Set it on the
+`Application`, once:
+
+- `path: .` when the artifact holds one Stage's manifests at its root — a
+  promotion that rendered only its own Stage.
+- `path: <stage>` when one artifact holds a subdirectory per Stage — a promotion
+  that rendered every Stage at once.
+
+That split is deliberate: which subdirectory an environment reads is a property
+of the environment, not of the release flowing through it.
 
 ## `revision` must be a digest
 

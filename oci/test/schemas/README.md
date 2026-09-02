@@ -16,7 +16,7 @@ Refresh them, and bump the commit above, with:
 ```console
 REF=<commit-or-tag>
 for s in oci-push tar helm-template kustomize-build git-clone \
-         argocd-update argocd-common compose-output; do
+         argocd-update argocd-common compose-output set-metadata http; do
   gh api "repos/akuity/kargo/contents/pkg/promotion/runner/builtin/schemas/$s.json?ref=$REF" \
     --jq '.content' 2>/dev/null | base64 -d > "$s.json" ||
   gh api "repos/akuity/kargo/contents/pkg/promotion/runner/builtin/schemas/$s-config.json?ref=$REF" \

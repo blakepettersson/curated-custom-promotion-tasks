@@ -243,10 +243,10 @@ fetch_blob() { # repo digest out-file
 
 # ------------------------------------------------------------------ rendering
 
-# Renders the example chart the way the `helm-template` step configured by
-# hydrate-helm-to-oci does: a flat directory of manifests, CRDs included, with
-# an optional per-stage values overlay that is skipped when absent
-# (ignoreMissingValueFiles).
+# Renders the example chart the way the `helm-template` step in
+# publish-manifests-to-oci/examples/single-stage.yaml does: a flat directory of
+# manifests, CRDs included, with an optional per-stage values overlay that is
+# skipped when absent (ignoreMissingValueFiles).
 render_helm() { # stage out-dir
   local stage="$1" out="$2"
   local args=(-f "$EXAMPLE_APP/chart/values.yaml")
@@ -266,13 +266,28 @@ render_helm() { # stage out-dir
   find "$staging" -name '*.yaml' -exec cp {} "$out/" \;
 }
 
-# Renders the example overlay the way the `kustomize-build` step configured by
-# hydrate-kustomize-to-oci does: one file per resource in an output directory.
+# Renders the example overlay the way the `kustomize-build` step in
+# publish-manifests-to-oci/examples/entry-stage-kustomize.yaml does: one file
+# per resource in an output directory.
 render_kustomize() { # stage out-dir
   local stage="$1" out="$2"
   rm -rf "$out"
   mkdir -p "$out"
   kustomize build "$EXAMPLE_APP/overlays/$stage" -o "$out"
+}
+
+# Renders every named Stage into its own subdirectory of one output directory,
+# as the promotion template in publish-manifests-to-oci/examples/stage.yaml
+# does: one helm-template step per Stage, each with that Stage's values file.
+render_helm_all_stages() { # out-dir stage...
+  local out="$1"
+  shift
+  rm -rf "$out"
+  mkdir -p "$out"
+  local stage
+  for stage in "$@"; do
+    render_helm "$stage" "$out/$stage"
+  done
 }
 
 # Archives a rendered directory as the `tar` step with `gzip: true` does.
@@ -309,6 +324,20 @@ assert_equal() { # actual expected description
 # preprocessing from prepending a file's leading comments to every result.
 q() { # file jq-filter
   yqq -o=json "$1" | jqq -r "$2"
+}
+
+# Every task that packages a directory and pushes it as an artifact, i.e. that
+# carries the archive/push/retag tail. There is one today — publishing lives in
+# a single task on purpose, since a task cannot call another and every
+# all-in-one variant would duplicate this tail. Discovered rather than named so
+# that a second one cannot be added without these checks covering it.
+archive_publishing_tasks() {
+  local yaml
+  for yaml in "$TASKS_DIR"/*/cluster-promotion-task.yaml; do
+    if [ "$(q "$yaml" '[.spec.steps[] | select(.uses == "oci-push" and (.config | has("srcPath")))] | length')" != "0" ]; then
+      printf '%s\n' "$yaml"
+    fi
+  done
 }
 
 # Reads a field of the nth task-calling step of a Stage's promotion template.

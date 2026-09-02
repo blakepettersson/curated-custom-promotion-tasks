@@ -20,17 +20,27 @@ spec:
     # OCI repository holding the artifact, without a tag or digest. Required.
     # Must match the Application source's repoURL less its oci:// prefix.
     - name: ociRepo
-    # The artifact to sync to, as a digest. Defaults to the digest of the OCI
-    # artifact in the Freight being promoted, which is what a Stage downstream
-    # of the hydrating Stage wants. Override it with the hydrate task's `digest`
-    # output when hydrating and deploying in the same promotion.
+    # The artifact to sync to, as a digest. The default covers both ways a Stage
+    # can come to know one, in order:
+    #
+    #   1. Metadata recorded on the Freight by publish-manifests-to-oci, for a
+    #      Stage downstream of one that hydrated for the whole pipeline. One
+    #      Freight, one commit, one set of image digests, flowing all the way
+    #      through — the manifests are a property of it.
+    #   2. Failing that, the digest of the OCI artifact in the Freight itself,
+    #      for a Stage whose Warehouse subscribes to the registry. Its Freight
+    #      *is* the artifact, which is the only shape that works across a
+    #      boundary Freight metadata cannot cross.
+    #
+    # Override it with the hydrate task's `digest` output when hydrating and
+    # deploying in the same promotion.
     #
     # This must be a digest, not a tag. Argo CD records the digest of a synced
     # OCI artifact as the Application's revision, and `argocd-update` waits
     # until that value equals `desiredRevision` — a tag would never match and
     # the step would wait until the promotion timed out.
     - name: revision
-      value: ${{ imageFrom(vars.ociRepo).Digest }}
+      value: ${{ freightMetadata(ctx.targetFreight.name)?.ociManifests?.digest ?? imageFrom(vars.ociRepo).Digest }}
     # Name of the Argo CD Application to update.
     - name: appName
       value: ${{ ctx.project }}-${{ ctx.stage }}

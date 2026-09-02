@@ -1,0 +1,59 @@
+# A Stage for a cluster Kargo cannot reach.
+#
+# There is no argocd-update here, because there is no route to that cluster's
+# Argo CD. Instead the promotion mirrors the artifact across the boundary and
+# then waits for the enclave to report, out through a status endpoint, that it is
+# running the digest that was mirrored.
+#
+# The promotion is a real gate: it stays Running — visible and cancellable —
+# until the enclave confirms the digest, fails if the endpoint returns an error,
+# and fails after the task's one-hour retry timeout if the enclave says nothing
+# at all. What it is not is a *deploy*: nothing here caused the rollout, so if
+# the enclave never rolls out, this reports a timeout rather than a failure with
+# a cause.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: prod-enclave
+  namespace: example-app
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        stages:
+          - test
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: digest
+          value: ${{ freightMetadata(ctx.targetFreight.name).ociManifests.digest }}
+
+      steps:
+        # Copy the artifact into the registry the enclave can read. A
+        # same-digest copy across registries, so the enclave gets the identical
+        # bytes that were verified upstream — this is the only thing that
+        # crosses the boundary.
+        #
+        # `srcRef` is pinned by digest, not tag, so what is mirrored cannot
+        # depend on when the mirror ran.
+        - uses: oci-push
+          as: mirror
+          config:
+            srcRef: ghcr.io/example/config/example-app@${{ vars.digest }}
+            destRef: registry.enclave.example/config/example-app:${{ ctx.promotion }}
+
+        # Wait for the enclave to say it is running that digest. The endpoint is
+        # somewhere both sides reach outbound; neither has to accept inbound
+        # connections.
+        - task:
+            name: await-oci-deploy
+            kind: ClusterPromotionTask
+          as: await
+          vars:
+            - name: statusURL
+              value: https://status.example.com/enclaves/prod/example-app
+            - name: digest
+              value: ${{ vars.digest }}

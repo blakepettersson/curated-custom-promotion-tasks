@@ -41,6 +41,11 @@ setup_file() {
   export E2E_KUSTOMIZE_DIR="$BATS_FILE_TMPDIR/rendered-kustomize"
   render_helm stage "$E2E_HELM_DIR"
   render_kustomize prod "$E2E_KUSTOMIZE_DIR"
+
+  # The "hydrate once for every Stage" shape: one directory holding one
+  # subdirectory per Stage, published as a single artifact.
+  export E2E_ALL_STAGES_DIR="$BATS_FILE_TMPDIR/rendered-all-stages"
+  render_helm_all_stages "$E2E_ALL_STAGES_DIR" test stage prod
 }
 
 teardown_file() {
@@ -101,6 +106,66 @@ setup() {
   prefixed="$(tar -tzf "$tarball" | grep -c '/' || true)"
   CONTEXT="$(tar -tzf "$tarball" | tr '\n' ' ')"
   assert_equal "$prefixed" "0" 'no archive entry may carry a directory prefix'
+}
+
+# ------------------------------------------------------- one artifact, N stages
+
+# The claim the "hydrate once" design rests on: a single artifact can carry a
+# correctly rendered copy for every Stage, because Argo CD's OCI source takes a
+# `path` that selects one subdirectory of the expanded artifact.
+@test 'one render produces a per-stage subdirectory that really differs' {
+  CONTEXT="$E2E_ALL_STAGES_DIR"
+  local stage
+  for stage in test stage prod; do
+    [ -f "$E2E_ALL_STAGES_DIR/$stage/deployment.yaml" ] ||
+      fail_with "no deployment.yaml rendered for $stage" || return 1
+  done
+
+  # values-<stage>.yaml sets replicas per Stage, so if these three agreed the
+  # per-Stage values files were not applied and one artifact would be shipping
+  # the wrong manifests to two of the three.
+  local test_replicas stage_replicas prod_replicas
+  test_replicas="$(q "$E2E_ALL_STAGES_DIR/test/deployment.yaml" '.spec.replicas')"
+  stage_replicas="$(q "$E2E_ALL_STAGES_DIR/stage/deployment.yaml" '.spec.replicas')"
+  prod_replicas="$(q "$E2E_ALL_STAGES_DIR/prod/deployment.yaml" '.spec.replicas')"
+  CONTEXT="test=$test_replicas stage=$stage_replicas prod=$prod_replicas"
+  assert_equal "$test_replicas" "1" "test replicas (values.yaml alone)"
+  assert_equal "$stage_replicas" "2" "stage replicas (values-stage.yaml)"
+  assert_equal "$prod_replicas" "3" "prod replicas (values-prod.yaml)"
+}
+
+@test 'the multi-stage artifact round-trips with one subdirectory per stage' {
+  local tarball="$BATS_TEST_TMPDIR/manifests.tar.gz"
+  archive "$E2E_ALL_STAGES_DIR" "$tarball"
+  push_artifact config/all-stages promo-1 "$tarball"
+
+  # Every entry is prefixed with its Stage, which is what an Application's
+  # `path` selects. The single-stage shape asserts the opposite, and the two
+  # together are the whole difference between the designs.
+  CONTEXT="$(tar -tzf "$tarball" | tr '\n' ' ')"
+  local unprefixed
+  unprefixed="$(tar -tzf "$tarball" | grep -vc '/' || true)"
+  assert_equal "$unprefixed" "0" 'every entry must sit under its stage directory'
+
+  local digest pulled unpacked
+  digest="$(fetch_manifest config/all-stages promo-1 | jqq -r '.layers[0].digest')"
+  pulled="$BATS_TEST_TMPDIR/pulled.tar.gz"
+  unpacked="$BATS_TEST_TMPDIR/unpacked-all"
+  fetch_blob config/all-stages "$digest" "$pulled"
+  mkdir -p "$unpacked"
+  tar -C "$unpacked" -xzf "$pulled"
+
+  CONTEXT="$(diff -r "$E2E_ALL_STAGES_DIR" "$unpacked" 2>&1 | head -20)"
+  diff -r "$E2E_ALL_STAGES_DIR" "$unpacked" > /dev/null ||
+    fail_with 'the pulled artifact differs from the rendered manifests'
+
+  # One digest, three Stages. This is the property that makes prod provably the
+  # same render as test rather than a re-render that agreed at the time.
+  local prod_digest
+  push_artifact config/all-stages prod-deploy "$tarball"
+  prod_digest="$(resolve_digest config/all-stages prod-deploy)"
+  assert_equal "$prod_digest" "$(resolve_digest config/all-stages promo-1)" \
+    'every stage deploys one digest'
 }
 
 # ------------------------------------------------------------------- pushing

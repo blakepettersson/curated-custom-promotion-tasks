@@ -1,0 +1,65 @@
+# The render-every-Stage shape with Kustomize instead of Helm.
+#
+# Identical to entry-stage.yaml but for the render steps: publish-manifests-to-oci
+# takes a directory and does not care what produced it. One kustomize-build per
+# Stage, each building that Stage's overlay into its own subdirectory.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: test
+  namespace: example-app
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        direct: true
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: repoURL
+          value: https://github.com/example/example-app.git
+        - name: ociRepo
+          value: ghcr.io/example/config/example-app
+
+      steps:
+        - uses: git-clone
+          as: clone
+          config:
+            repoURL: ${{ vars.repoURL }}
+            checkout:
+              - commit: ${{ commitFrom(vars.repoURL).ID }}
+                path: ./src
+
+        # An outPath directory splits the build into one file per resource,
+        # named [namespace-]kind-name.yaml. A single file would work too; a
+        # directory keeps the artifact readable to anyone who pulls it.
+        - uses: kustomize-build
+          as: render-test
+          config:
+            path: ./src/overlays/test
+            outPath: ./manifests/test
+
+        - uses: kustomize-build
+          as: render-stage
+          config:
+            path: ./src/overlays/stage
+            outPath: ./manifests/stage
+
+        - uses: kustomize-build
+          as: render-prod
+          config:
+            path: ./src/overlays/prod
+            outPath: ./manifests/prod
+
+        - task:
+            name: publish-manifests-to-oci
+            kind: ClusterPromotionTask
+          as: publish
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+            - name: repoURL
+              value: ${{ vars.repoURL }}

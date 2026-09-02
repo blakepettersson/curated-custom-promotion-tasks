@@ -125,10 +125,25 @@ through someone's release. These are the ones that have bitten here.
   compiles expressions with a plain `expr.Compile` and its API types carry no
   `expr:` tags, so `expr`'s `runtime.Fetch` matches the field name exactly.
   Lowercase spellings appear in some upstream docs examples and do not work.
+- Only `config` is expression-templated. A step's other fields are typed Go
+  fields: `retry.timeout` is a `metav1.Duration`, so `${{ vars.timeout }}` there
+  fails as a duration that will not parse, and no schema check would notice.
+- A step's own expression fields have their own, narrower environment. The `http`
+  step evaluates `successExpression` with only `response` in scope — no `vars`,
+  no `ctx` — so a value from a var must be interpolated into the expression's
+  text by the config templating.
 - Read the step's schema in
   `pkg/promotion/runner/builtin/schemas/<step>-config.json`, not just the docs
   page: the published docs describe the last release, and a step whose behaviour
   you depend on may only have it on `main`.
+- Prefer one composable task over several all-in-one ones. Since tasks do not
+  nest, every all-in-one variant carries its own copy of the shared tail, and
+  nothing but a test can hold the copies in agreement. `oci/` has one publishing
+  task and leaves rendering to the caller's own `helm-template` steps for
+  exactly this reason.
+- A step's config cannot be looped over. There is no `matrix` or `forEach`, so a
+  var holding a list cannot drive N steps; N steps get written out. Design a
+  task around what one step can do, and let the promotion template repeat it.
 
 Test a task against those schemas. [`oci/test/`](oci/test) is the pattern:
 `lint-task.py` checks each task against vendored, pinned copies of Kargo's own

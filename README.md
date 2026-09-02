@@ -24,7 +24,7 @@ One directory per tool, each self-contained with its own examples, tests and
 | Family | Contents |
 |---|---|
 | [`kyverno/`](kyverno) | [`kyverno-validate`](kyverno/steps/kyverno-validate) — validates Kyverno policies with the Kyverno CLI and checks manifests against them |
-| [`oci/`](oci) | [`hydrate-helm-to-oci`](oci/tasks/hydrate-helm-to-oci), [`hydrate-kustomize-to-oci`](oci/tasks/hydrate-kustomize-to-oci) — render manifests and publish them as an OCI artifact; [`deploy-oci-to-argocd`](oci/tasks/deploy-oci-to-argocd) — sync an Argo CD Application to one |
+| [`oci/`](oci) | [`publish-manifests-to-oci`](oci/tasks/publish-manifests-to-oci) — publish rendered manifests as an OCI artifact; [`deploy-oci-to-argocd`](oci/tasks/deploy-oci-to-argocd), [`await-oci-deploy`](oci/tasks/await-oci-deploy) — deploy one, reachable cluster or not |
 
 A family holds `steps/` when it ships images, `tasks/` when it ships YAML, or
 both.
