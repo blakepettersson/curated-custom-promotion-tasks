@@ -1,0 +1,32 @@
+# The Argo CD Application the task updates. Two fields have to line up with the
+# task's vars, because `argocd-update` identifies the source to update by its
+# repoURL:
+#
+#   * spec.source.repoURL must equal oci://<the task's ociRepo>, prefix included.
+#   * spec.source.targetRevision is owned by the task once
+#     updateTargetRevision is true (the default). The value below is only a
+#     starting point; every promotion rewrites it to the digest it deployed.
+#
+# There is no `path`. Kargo's `tar` step names entries relative to its `inPath`
+# and omits the root directory entry, so the artifact unpacks to a flat root of
+# manifests — the Application's source directory is the artifact itself.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: example-app-prod
+  namespace: argocd
+  annotations:
+    # Lets Kargo update this Application. Without it, argocd-update refuses to
+    # touch it.
+    kargo.akuity.io/authorized-stage: example-app:prod
+spec:
+  project: default
+  source:
+    repoURL: oci://ghcr.io/example/config/example-app
+    targetRevision: stage
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: example-app-prod
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

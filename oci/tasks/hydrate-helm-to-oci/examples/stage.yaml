@@ -1,0 +1,54 @@
+# Hydrate and deploy in one promotion: render the chart, publish it to the
+# registry, then point the Argo CD Application at the digest that was published.
+#
+# This is the shape to reach for first. The alternative — hydrate in one Stage
+# and let downstream Stages subscribe to the artifact — is in
+# ../../deploy-oci-to-argocd/examples/.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: stage
+  namespace: example-app
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        direct: true
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: repoURL
+          value: https://github.com/example/example-app.git
+        - name: ociRepo
+          value: ghcr.io/example/config/example-app
+
+      steps:
+        # Renders ./src/chart and publishes it as an OCI artifact under two
+        # tags: ${{ ctx.promotion }} and, moved to it, `stage`.
+        - task:
+            name: hydrate-helm-to-oci
+            kind: ClusterPromotionTask
+          as: hydrate
+          vars:
+            - name: repoURL
+              value: ${{ vars.repoURL }}
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+
+        # `revision` is the digest the hydrate step just pushed, not the tag:
+        # Argo CD records a synced OCI artifact's digest as the Application's
+        # revision, and the step waits for those to match.
+        - task:
+            name: deploy-oci-to-argocd
+            kind: ClusterPromotionTask
+          as: deploy
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+            - name: revision
+              value: ${{ outputs.hydrate.digest }}
+            - name: appName
+              value: example-app-${{ ctx.stage }}

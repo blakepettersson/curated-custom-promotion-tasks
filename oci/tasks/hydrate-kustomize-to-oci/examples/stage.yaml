@@ -1,0 +1,50 @@
+# Hydrate and deploy in one promotion: build the overlay for this Stage, publish
+# it to the registry, then point the Argo CD Application at the digest that was
+# published.
+#
+# The overlay path defaults to overlays/${{ ctx.stage }}, so a Stage named
+# "prod" builds ./src/overlays/prod with no configuration at all.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: prod
+  namespace: example-app
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        stages:
+          - stage
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: repoURL
+          value: https://github.com/example/example-app.git
+        - name: ociRepo
+          value: ghcr.io/example/config/example-app
+
+      steps:
+        - task:
+            name: hydrate-kustomize-to-oci
+            kind: ClusterPromotionTask
+          as: hydrate
+          vars:
+            - name: repoURL
+              value: ${{ vars.repoURL }}
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+
+        - task:
+            name: deploy-oci-to-argocd
+            kind: ClusterPromotionTask
+          as: deploy
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+            - name: revision
+              value: ${{ outputs.hydrate.digest }}
+            - name: appName
+              value: example-app-${{ ctx.stage }}

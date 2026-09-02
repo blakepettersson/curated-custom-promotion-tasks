@@ -1,0 +1,70 @@
+# Points an Argo CD Application's OCI source at a specific artifact digest and
+# waits for it to sync.
+#
+# Two callers, one task:
+#
+#   * A downstream Stage whose Warehouse subscribes to the OCI repository. The
+#     default `revision` reads the digest straight out of the Freight, so the
+#     Stage needs to set nothing but `ociRepo` and `appName`.
+#   * The Stage that just hydrated the artifact. Override `revision` with the
+#     hydrate task's `digest` output.
+#
+# Register it once per cluster, then reference it from any project's promotion
+# template (see examples/stage.yaml).
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ClusterPromotionTask
+metadata:
+  name: deploy-oci-to-argocd
+spec:
+  vars:
+    # OCI repository holding the artifact, without a tag or digest. Required.
+    # Must match the Application source's repoURL less its oci:// prefix.
+    - name: ociRepo
+    # The artifact to sync to, as a digest. Defaults to the digest of the OCI
+    # artifact in the Freight being promoted, which is what a Stage downstream
+    # of the hydrating Stage wants. Override it with the hydrate task's `digest`
+    # output when hydrating and deploying in the same promotion.
+    #
+    # This must be a digest, not a tag. Argo CD records the digest of a synced
+    # OCI artifact as the Application's revision, and `argocd-update` waits
+    # until that value equals `desiredRevision` — a tag would never match and
+    # the step would wait until the promotion timed out.
+    - name: revision
+      value: ${{ imageFrom(vars.ociRepo).Digest }}
+    # Name of the Argo CD Application to update.
+    - name: appName
+      value: ${{ ctx.project }}-${{ ctx.stage }}
+    # Namespace the Application lives in.
+    - name: appNamespace
+      value: argocd
+    # Whether to rewrite the source's targetRevision to the digest, pinning the
+    # Application to exactly this artifact. Leaving it true is the point of the
+    # task; set it to false to health-check against `revision` without taking
+    # ownership of the Application's targetRevision.
+    - name: updateTargetRevision
+      value: "true"
+
+  steps:
+    # `argocd-update` is a long-running step: it reports Running until the
+    # Application is synced to `desiredRevision` and healthy, so there is no
+    # separate wait step to add after it.
+    - uses: argocd-update
+      as: sync
+      config:
+        apps:
+          - name: ${{ vars.appName }}
+            namespace: ${{ vars.appNamespace }}
+            sources:
+              # The oci:// prefix is what marks this an OCI source to Argo CD,
+              # and it has to match the Application's own repoURL exactly.
+              - repoURL: oci://${{ vars.ociRepo }}
+                desiredRevision: ${{ vars.revision }}
+                updateTargetRevision: ${{ vars.updateTargetRevision }}
+
+    - uses: compose-output
+      as: output
+      config:
+        ref: ${{ vars.ociRepo }}@${{ vars.revision }}
+        revision: ${{ vars.revision }}
+        app: ${{ vars.appName }}
+        appNamespace: ${{ vars.appNamespace }}

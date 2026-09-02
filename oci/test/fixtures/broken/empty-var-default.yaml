@@ -1,0 +1,27 @@
+# The shape every fixture in broken/ starts from: a task that lints clean.
+# Keeping it here means a fixture's failure is attributable to the one thing it
+# breaks, rather than to something it never had.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ClusterPromotionTask
+metadata:
+  name: fixture-empty-var-default
+spec:
+  vars:
+    - name: ociRepo
+      value: ""
+  steps:
+    - uses: tar
+      as: archive
+      config:
+        inPath: ./manifests
+        outPath: ./manifests.tar.gz
+        gzip: true
+    - uses: oci-push
+      as: push
+      config:
+        srcPath: ./manifests.tar.gz
+        destRef: ${{ vars.ociRepo }}:latest
+    - uses: compose-output
+      as: output
+      config:
+        digest: ${{ task.outputs.push.digest }}

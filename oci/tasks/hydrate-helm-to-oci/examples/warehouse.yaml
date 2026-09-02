@@ -1,0 +1,17 @@
+# The Warehouse the hydrating Stage draws Freight from: the config repository
+# itself, plus the application image the chart deploys. Nothing OCI-specific —
+# the artifact this Stage publishes is an output of the promotion, not an input
+# to it.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Warehouse
+metadata:
+  name: example-app
+  namespace: example-app
+spec:
+  interval: 5m
+  subscriptions:
+    - git:
+        repoURL: https://github.com/example/example-app.git
+    - image:
+        repoURL: ghcr.io/example/example-app
+        imageSelectionStrategy: SemVer

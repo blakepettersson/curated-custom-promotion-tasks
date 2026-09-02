@@ -1,0 +1,16 @@
+# The shape every fixture in broken/ starts from: a task that lints clean.
+# Keeping it here means a fixture's failure is attributable to the one thing it
+# breaks, rather than to something it never had.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ClusterPromotionTask
+metadata:
+  name: fixture-bad-enum
+spec:
+  steps:
+    - uses: helm-template
+      as: render
+      config:
+        path: ./src
+        releaseName: app
+        outPath: ./manifests
+        outLayout: nested
