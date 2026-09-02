@@ -16,7 +16,7 @@ Refresh them, and bump the commit above, with:
 ```console
 REF=<commit-or-tag>
 for s in oci-push tar helm-template kustomize-build git-clone \
-         argocd-update argocd-common common compose-output; do
+         argocd-update argocd-common compose-output; do
   gh api "repos/akuity/kargo/contents/pkg/promotion/runner/builtin/schemas/$s.json?ref=$REF" \
     --jq '.content' 2>/dev/null | base64 -d > "$s.json" ||
   gh api "repos/akuity/kargo/contents/pkg/promotion/runner/builtin/schemas/$s-config.json?ref=$REF" \
@@ -24,10 +24,10 @@ for s in oci-push tar helm-template kustomize-build git-clone \
 done
 ```
 
-Upstream names most of these `<step>-config.json` and the two shared definition
-files `argocd-common.json` and `common.json`; they are stored here as
-`<step>.json` so the linter can find a step's schema from its `uses` value, and
-resolve a `$ref` to a shared file by its own name.
+Upstream names most of these `<step>-config.json`, and `argocd-common.json` is
+a file of shared definitions that `argocd-update.json` `$ref`s; they are stored
+here as `<step>.json` so the linter can find a step's schema from its `uses`
+value, and resolve a `$ref` to a shared file by its own name.
 
 Only steps this family uses are vendored. A task that reaches for another
 built-in step will fail its own lint with "no schema for this step" until that
