@@ -1,20 +1,26 @@
 # Working in this repository
 
-Kargo custom promotion steps: a container image per step, the
-`CustomPromotionStep` manifest that registers it, promotion tasks that compose
-it, and CI that builds, tests and publishes the image.
+Two kinds of thing live here:
 
-Read [`README.md`](README.md) for the layout and
+- **Custom promotion steps** — a container image per step, the
+  `CustomPromotionStep` manifest that registers it, promotion tasks that compose
+  it, and CI that builds, tests and publishes the image.
+- **Promotion tasks** — `ClusterPromotionTask` manifests composed entirely of
+  Kargo's *built-in* steps. No image, no registry, no publish job.
+
+Read [`README.md`](README.md) for the layout,
 [`kyverno/steps/kyverno-validate`](kyverno/steps/kyverno-validate) as the
-reference implementation. Everything below is what a new step has to get right.
+reference step, and [`oci/`](oci) as the reference task family. Everything below
+is what a new one has to get right.
 
 ## Where things go
 
-One directory per tool family (`kyverno/`, and siblings to come), one directory
-per step beneath it:
+One directory per tool family (`kyverno/`, `oci/`, and siblings to come). A
+family holds `steps/` when it ships images, `tasks/` when it ships YAML, or
+both:
 
 ```
-<family>/Makefile                          build, lint, test, e2e for the family
+<family>/Makefile                          lint, test, e2e (and build, for steps)
 <family>/steps/<step>/Dockerfile
 <family>/steps/<step>/src/<step>           entrypoint script (executable, 0755)
 <family>/steps/<step>/custom-promotion-step.yaml
@@ -23,8 +29,12 @@ per step beneath it:
 <family>/steps/<step>/test/e2e-chart.bats  the family's examples, end to end
 <family>/steps/<step>/test/helpers.bash    run_step + assertions the .bats files load
 <family>/steps/<step>/test/fixtures/
+<family>/tasks/<task>/cluster-promotion-task.yaml
+<family>/tasks/<task>/README.md            vars, outputs, and the traps it closes
+<family>/tasks/<task>/examples/            stage, warehouse, anything it expects
+<family>/test/                             the family's suites, for a task family
 <family>/examples/                         fixtures a real project would hold
-.github/workflows/<step>.yaml              one workflow per step
+.github/workflows/<name>.yaml              one per step, one per task family
 ```
 
 ## The Kargo contract
@@ -84,6 +94,94 @@ gate built on that exit code passes every broken policy set. Hence
 Assume any tool may: exit 0 on partial failure, report problems only at raised
 verbosity, write results to stdout in one mode and nothing at all in another, or
 treat "no results" and "everything passed" identically.
+
+## Promotion task conventions
+
+A task is YAML, so every mistake it can hold is one Kargo reports halfway
+through someone's release. These are the ones that have bitten here.
+
+- Give every step an `as` alias. Inside a task, an earlier step's output is
+  `task.outputs.<alias>`; plain `outputs.<alias>` does not resolve, and the
+  calling Stage uses the plain form for the task's own output. Getting these
+  backwards is the most common error.
+- Expose results with a final `compose-output` step. Echo back what a caller
+  would otherwise have to recompute — the digest-pinned reference, not just the
+  digest.
+- Declare a var with no `value` to require it of the caller. Never write
+  `value: ""`: every string field in the step schemas is `minLength: 1`, so an
+  empty default reaches the step as `""` and is rejected. It is not treated as
+  absent.
+- A whole-value expression takes the expression's type: `${{ vars.gzip }}` alone
+  in a boolean field evaluates to a boolean. Interpolated into surrounding text
+  it is always a string, and a boolean field then fails. A var value that parses
+  as JSON becomes that JSON, so a var can carry a list into an array field.
+- Var defaults may reference `ctx` and previously declared vars, so declare them
+  in dependency order.
+- Tasks do not nest — Kargo validates a task's steps as
+  `has(self.uses) && !has(self.task)`. A two-part flow is two task references in
+  the calling Stage.
+- Field access in expressions uses **Go field names**, not JSON keys:
+  `commitFrom(...).ID`, `.RepoURL`, `imageFrom(...).Digest`, `.Tag`. Kargo
+  compiles expressions with a plain `expr.Compile` and its API types carry no
+  `expr:` tags, so `expr`'s `runtime.Fetch` matches the field name exactly.
+  Lowercase spellings appear in some upstream docs examples and do not work.
+- Only `config` is expression-templated. A step's other fields are typed Go
+  fields: `retry.timeout` is a `metav1.Duration`, so `${{ vars.timeout }}` there
+  fails as a duration that will not parse, and no schema check would notice.
+- A step's own expression fields have their own, narrower environment. The `http`
+  step evaluates `successExpression` with only `response` in scope — no `vars`,
+  no `ctx` — so a value from a var must be interpolated into the expression's
+  text by the config templating.
+- Read the step's schema in
+  `pkg/promotion/runner/builtin/schemas/<step>-config.json`, not just the docs
+  page: the published docs describe the last release, and a step whose behaviour
+  you depend on may only have it on `main`.
+- Prefer one composable task over several all-in-one ones. Since tasks do not
+  nest, every all-in-one variant carries its own copy of the shared tail, and
+  nothing but a test can hold the copies in agreement. `oci/` has one publishing
+  task and leaves rendering to the caller's own `helm-template` steps for
+  exactly this reason.
+- A step's config cannot be looped over. There is no `matrix` or `forEach`, so a
+  var holding a list cannot drive N steps; N steps get written out. Design a
+  task around what one step can do, and let the promotion template repeat it.
+
+Test a task against those schemas. [`oci/test/`](oci/test) is the pattern:
+`lint-task.py` checks each task against vendored, pinned copies of Kargo's own
+schemas and adds the cross-step rules no schema can express, `tasks.bats` drives
+it with one negative-control fixture per check, and `e2e-recipe.bats` runs the
+pipeline the task describes against real tools. Vendor only the schemas the
+family uses, and record the upstream commit they came from.
+
+Then promote through a real Kargo: `e2e-kargo.bats` builds a kind cluster,
+installs the chart and runs the task file itself, which is the only check that
+Kargo's steps agree with what the task assumes. A task family ships only YAML,
+so without it nothing in the repository has ever executed. What that costs is a
+few minutes and these traps, all of which cost an hour here first:
+
+- Kargo's enterprise-only pieces cannot be part of it. `CustomPromotionStep` is
+  `ee.kargo.akuity.io`, absent from OSS Kargo, so a step family stays on its
+  bats harness and only task families get this suite.
+- Point the task at the registry's **ClusterIP**. go-containerregistry picks
+  plain HTTP for an RFC1918 address (and for `localhost:`/`*.localhost`), so a
+  10.x address needs no TLS and no `insecureSkipTLSVerify` in the task under
+  test. A Service DNS name would be HTTPS and would need a certificate.
+- A Git server can be nginx over *dumb* HTTP. Kargo shells out to the git CLI,
+  which clones that happily once `git update-server-info` has been run in the
+  bare repository — no Gitea, no database, no user setup. Probe it on TCP, not
+  with an HTTP GET of `/`: its document root is empty until the suite seeds it,
+  nginx answers 403 for a directory it will not index, and the Deployment then
+  never becomes available.
+- `kubectl cp` onto a path that exists copies *into* it. Seeding a repository
+  twice therefore leaves the first one being served, and every case then runs
+  against the previous commit. Remove the destination first.
+- Wait for the Freight carrying the commit you just seeded, not for any Freight,
+  and force discovery with the `kargo.akuity.io/refresh` annotation rather than
+  waiting out the Warehouse's interval.
+- Kargo names Promotions itself, so create with `generateName` and read the name
+  back from `kubectl create -o name`.
+- Never background a shell *function* you intend to kill: `$!` is the subshell's
+  pid, the real process survives the kill, and an orphan holding bats' output
+  descriptor hangs the run after every case has passed.
 
 ## Image conventions
 
@@ -163,8 +261,8 @@ make all
 
 ## CI
 
-Copy `.github/workflows/kyverno-validate.yaml` and change the paths, the image
-name and the tag prefix. Its shape is deliberate:
+For a step, copy `.github/workflows/kyverno-validate.yaml` and change the
+paths, the image name and the tag prefix. Its shape is deliberate:
 
 - lint → test → publish, with `publish` needing both. Nothing untested is pushed.
 - `paths:` filters are repo-root-relative; `../` is invalid there. They belong on
@@ -178,12 +276,26 @@ name and the tag prefix. Its shape is deliberate:
   pushes to `main` publish `:main` and `:sha-<sha>`. Pin a released tag in the
   `CustomPromotionStep` manifest.
 
+For a task family, copy `.github/workflows/oci-tasks.yaml`: lint, test, e2e and
+no publish job, since there is no artifact and a merge to `main` is the release.
+One workflow per family rather than per task — the suites cover the family.
+
 ## Before you call it done
 
-1. `make lint && make test && make e2e` from the family directory.
-2. `docker buildx build --platform linux/amd64,linux/arm64 --output type=cacheonly .`
-   in the step directory — arm64 breaks in ways amd64 does not.
-3. After CI publishes, run the suite against the published image:
-   `IMAGE=ghcr.io/<owner>/<repo>/<step>:main bats test/`. It is the only check
-   that what the registry holds behaves like what you built.
-4. Report what you actually ran. "Tests pass" means you ran them.
+1. `make lint && make test && make e2e` from the family directory, plus
+   `make e2e-kargo` for a task family — it is not part of `make all`, because it
+   builds a cluster.
+2. For a step: `docker buildx build --platform linux/amd64,linux/arm64 --output
+   type=cacheonly .` in the step directory — arm64 breaks in ways amd64 does
+   not.
+3. For a step, after CI publishes, run the suite against the published image:
+   `IMAGE=ghcr.io/<owner>/<repo>/<step>:main bats test/<step>.bats`. It is the
+   only check that what the registry holds behaves like what you built. Name the
+   file, not `test/` — that sweeps up the e2e suite, which needs helm.
+4. For a task, check what `e2e-kargo.bats` does *not* promote through. It runs
+   the publishing half against a real Kargo; anything needing Argo CD or an
+   external endpoint — `deploy-oci-to-argocd`, `await-oci-deploy` — is still
+   checked against schemas alone, so register those and promote once by hand
+   before relying on them.
+5. Report what you actually ran, and say plainly what you did not. "Tests pass"
+   means you ran them; a task nobody has promoted is a task nobody has run.

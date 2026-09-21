@@ -1,0 +1,107 @@
+# The two things a promotion of these tasks talks to, inside the test cluster:
+# a registry to publish the artifact to, and a Git server to render it from.
+#
+# Both are deliberately plain HTTP, and both are reachable under a name Kargo
+# will use without TLS:
+#
+#   * The registry is addressed by its ClusterIP. go-containerregistry, which
+#     `oci-push` uses, picks http:// for any RFC1918 address (pkg/name's
+#     Registry.Scheme), so a 10.x ClusterIP needs no certificate and no
+#     `insecureSkipTLSVerify` in the task under test.
+#   * The Git server is nginx serving a bare repository over *dumb* HTTP. Kargo
+#     shells out to the git CLI (pkg/controller/git), which speaks dumb HTTP
+#     fine once `git update-server-info` has been run in the repository — so a
+#     whole Gitea, its database and its user setup buy nothing here.
+#
+# Neither is a model of production. They exist so the promotion has somewhere
+# to clone from and somewhere to push to.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: oci-e2e-infra
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: oci-e2e-infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      containers:
+        - name: registry
+          image: registry:3
+          ports:
+            - containerPort: 5000
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: 5000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: oci-e2e-infra
+spec:
+  selector:
+    app: registry
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git
+  namespace: oci-e2e-infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: git
+  template:
+    metadata:
+      labels:
+        app: git
+    spec:
+      containers:
+        - name: nginx
+          # Alpine for the busybox tar that `kubectl cp` needs to unpack the
+          # seeded repository into the container.
+          image: nginx:1.29-alpine
+          ports:
+            - containerPort: 80
+          # TCP, not an HTTP GET of `/`: the document root is empty until the
+          # suite seeds a repository into it, and nginx answers 403 for a
+          # directory it will not index — so an HTTP probe would hold the
+          # Deployment unavailable and the suite would never get as far as
+          # seeding it.
+          readinessProbe:
+            tcpSocket:
+              port: 80
+          volumeMounts:
+            - name: repos
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: repos
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git
+  namespace: oci-e2e-infra
+spec:
+  selector:
+    app: git
+  ports:
+    - port: 80
+      targetPort: 80

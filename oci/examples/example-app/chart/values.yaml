@@ -1,0 +1,6 @@
+replicaCount: 1
+image:
+  repository: ghcr.io/example/example-app
+  tag: v1.0.0
+service:
+  port: 8080

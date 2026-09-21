@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HTTPConfig",
+
+  "definitions": {
+
+    "httpHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The name of the header."
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The value of the header."
+        }
+      }
+    },
+
+    "httpQueryParam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The name of the query parameter."
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The value of the query parameter."
+        }
+      }
+    },
+
+    "httpOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "fromExpression"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The name of the output."
+        },
+        "fromExpression": {
+          "type": "string",
+          "minLength": 1,
+          "description": "An expression to evaluate to extract the output from the HTTP response."
+        }
+      }
+    }
+  },
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["url"],
+  "oneOf": [
+    {
+      "properties": {
+        "body": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bodyFromFile": {
+          "enum": ["", null]
+        }
+      },
+      "required": ["body"]
+    },
+    {
+      "properties": {
+        "body": {
+          "enum": ["", null]
+        },
+        "bodyFromFile": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["bodyFromFile"]
+    },
+    {
+      "properties": {
+        "body": {
+          "enum": ["", null]
+        },
+        "bodyFromFile": {
+          "enum": ["", null]
+        }
+      }
+    }
+  ],
+  "properties": {
+    "method": {
+      "type": "string",
+      "description": "The HTTP method to use for the request.",
+      "pattern": "^(DELETE|GET|HEAD|PATCH|POST|PUT)$"
+    },
+    "url": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The URL to send the HTTP request to."
+    },
+    "headers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/httpHeader"
+      },
+      "description": "Headers to include in the HTTP request."
+    },
+    "queryParams": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/httpQueryParam"
+      },
+      "description": "Query parameters to include in the HTTP request."
+    },
+    "body": {
+      "type": "string",
+      "description": "The body of the HTTP request."
+    },
+    "bodyFromFile": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A path relative to the promotion work directory whose contents are used as the HTTP request body. Mutually exclusive with body."
+    },
+    "insecureSkipTLSVerify": {
+      "type": "boolean",
+      "description": "Whether to skip TLS verification when making the request. (Not recommended.)"
+    },
+    "proxy": {
+      "type": "string",
+      "pattern": "^https?://.*$",
+      "description": "The URL of the proxy server to send the HTTP request through. If not specified, defers to the HTTP transport's default proxy behavior (http.ProxyFromEnvironment)."
+    },
+    "timeout": {
+      "type": "string",
+      "pattern": "(?:\\d+(ns|us|µs|ms|s|m|h))+",
+      "description": "The maximum time to wait for the request to complete. If not specified, the default is 10 seconds."
+    },
+    "pollInterval": {
+      "type": "string",
+      "pattern": "(?:\\d+(ns|us|µs|ms|s|m|h))+",
+      "description": "The suggested interval at which to poll the URL while the step is waiting for its success or failure criteria to be met. This is only a suggestion: the controller enforces a lower bound and may reconcile sooner in response to other events. If not specified, the default is 30 seconds."
+    },
+    "responseContentType": {
+      "type": "string",
+      "description": "Optionally overrides the Content-Type header for response parsing. Accepts MIME media type values: 'application/json', 'application/yaml', or 'text/plain'. If not set, uses the Content-Type header from the response with JSON fallback.",
+      "pattern": "^(application/json|application/yaml|text/plain)$"
+    },
+    "outputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/httpOutput"
+      },
+      "description": "Outputs to extract from the HTTP response."
+    },
+    "successExpression": {
+      "type": "string",
+      "description": "An expression to evaluate to determine if the request was successful."
+    },
+    "failureExpression": {
+      "type": "string",
+      "description": "An expression to evaluate to determine if the request failed."
+    },
+    "errorExpression": {
+      "type": "string",
+      "description": "An expression to evaluate to extract an error message from the HTTP response."
+    }
+  }
+}

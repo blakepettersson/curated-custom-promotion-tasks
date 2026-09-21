@@ -1,0 +1,31 @@
+# A Stage that deploys a hydrated artifact it did not render. Its Freight is the
+# OCI artifact itself, so the whole promotion is one step: point the Argo CD
+# Application at the digest in the Freight and wait for it to sync.
+#
+# Because `revision` defaults to the digest of the OCI artifact in the Freight,
+# this Stage sets only what it cannot guess.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: prod
+  namespace: example-app
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app-manifests
+      sources:
+        direct: true
+
+  promotionTemplate:
+    spec:
+      steps:
+        - task:
+            name: deploy-oci-to-argocd
+            kind: ClusterPromotionTask
+          as: deploy
+          vars:
+            - name: ociRepo
+              value: ghcr.io/example/config/example-app
+            - name: appName
+              value: example-app-${{ ctx.stage }}

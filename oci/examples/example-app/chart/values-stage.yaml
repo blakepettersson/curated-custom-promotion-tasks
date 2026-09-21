@@ -1,0 +1,2 @@
+# Overlaid on values.yaml when the Stage is named "stage".
+replicaCount: 2

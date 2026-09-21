@@ -35,6 +35,14 @@ run_step_in() { # workdir config-json [docker args...]
   # The step runs as uid 65532 and has to be able to write its results.
   chmod 777 "$BATS_TEST_TMPDIR"
   chmod 666 "$out"
+  # …and to read the workspace. bats creates its temporary directories with a
+  # bare mkdir, so BATS_FILE_TMPDIR — and everything helm renders beneath it —
+  # inherits the invoking umask: 755 at umask 022, but 700 at umask 077. There
+  # the step cannot traverse its own working directory, every configured path
+  # expands to nothing, and the run fails as a misconfiguration rather than as
+  # the permissions problem it is. `X` adds execute only where one already
+  # exists, so the checked-in fixtures keep their modes.
+  chmod -R a+rX "$workdir"
   # `&& STATUS=0 || STATUS=$?` keeps a non-zero exit — which most of these
   # cases expect — from tripping the `set -e` that bats runs tests under.
   LOG="$(

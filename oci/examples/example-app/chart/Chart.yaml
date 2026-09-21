@@ -1,0 +1,6 @@
+apiVersion: v2
+name: example-app
+description: A minimal application, rendered by the hydrate tasks in the e2e suite
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

@@ -1,0 +1,34 @@
+# A Warehouse that treats hydrated manifests as Freight: it watches the mutable
+# tag the hydrating Stage moves, and produces new Freight whenever that tag
+# resolves to a new digest. Downstream Stages then promote a *rendered artifact*
+# rather than re-rendering it, which is the point of hydrating once.
+#
+# Three things about subscribing to a manifest artifact, all of which follow
+# from it being an OCI artifact rather than a container image. They are
+# properties of Kargo's image discovery, not preferences:
+#
+#   * imageSelectionStrategy MUST be Digest. `oci-push` writes no image config,
+#     so the artifact's creation time is the zero value and NewestBuild has
+#     nothing to order by. SemVer and Lexical need version-shaped tags, which a
+#     per-stage pointer tag is not.
+#
+#   * `constraint` is the mutable tag to follow. The Digest strategy resolves
+#     exactly this tag on every interval and treats the tag as mutable, so it
+#     never caches.
+#
+#   * `platform` MUST NOT be set. Kargo collects platforms only from an image
+#     index; a single-manifest artifact reports none, so *any* platform
+#     constraint filters the artifact out entirely and the Warehouse silently
+#     discovers nothing.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Warehouse
+metadata:
+  name: example-app-manifests
+  namespace: example-app
+spec:
+  interval: 1m
+  subscriptions:
+    - image:
+        repoURL: ghcr.io/example/config/example-app
+        imageSelectionStrategy: Digest
+        constraint: stage

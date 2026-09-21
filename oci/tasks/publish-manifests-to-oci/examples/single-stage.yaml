@@ -1,0 +1,90 @@
+# The simple case: one Stage renders its own manifests, publishes them, and
+# deploys them.
+#
+# Three steps rather than one task call, because the render is yours. That is
+# the same shape as the render-every-Stage case in entry-stage.yaml — the only
+# difference is how many helm-template steps there are — so there is one way to
+# do this rather than two.
+#
+# The manifests go to ./manifests directly, so the artifact holds them at its
+# root and the Argo CD Application uses `path: .`.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: stage
+  namespace: example-app
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        direct: true
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: repoURL
+          value: https://github.com/example/example-app.git
+        - name: ociRepo
+          value: ghcr.io/example/config/example-app
+        - name: chartPath
+          value: chart
+
+      steps:
+        # Pinned to the commit in the Freight, so this promotion renders from
+        # the commit that was promoted rather than from whatever the branch says
+        # now.
+        - uses: git-clone
+          as: clone
+          config:
+            repoURL: ${{ vars.repoURL }}
+            checkout:
+              - commit: ${{ commitFrom(vars.repoURL).ID }}
+                path: ./src
+
+        # `outLayout: flat` writes every manifest directly into ./manifests with
+        # no chart-named subdirectory, so the artifact unpacks to a flat root of
+        # manifests — the layout `path: .` expects.
+        #
+        # `includeCRDs` is worth turning on: nothing else in this pipeline would
+        # ever apply the chart's crds/ directory.
+        - uses: helm-template
+          as: render
+          config:
+            path: ./src/${{ vars.chartPath }}
+            releaseName: example-app
+            namespace: example-app-${{ ctx.stage }}
+            outPath: ./manifests
+            outLayout: flat
+            includeCRDs: true
+            valuesFiles:
+              - ./src/${{ vars.chartPath }}/values.yaml
+              # Optional per-Stage overlay, skipped when absent.
+              - ./src/${{ vars.chartPath }}/values-${{ ctx.stage }}.yaml
+            ignoreMissingValueFiles: true
+
+        - task:
+            name: publish-manifests-to-oci
+            kind: ClusterPromotionTask
+          as: publish
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+            - name: repoURL
+              value: ${{ vars.repoURL }}
+
+        # `revision` is the digest just published, not the tag: Argo CD records a
+        # synced OCI artifact's digest as the Application's revision, and the
+        # step waits for those to match.
+        - task:
+            name: deploy-oci-to-argocd
+            kind: ClusterPromotionTask
+          as: deploy
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+            - name: revision
+              value: ${{ outputs.publish.digest }}
+            - name: appName
+              value: example-app-${{ ctx.stage }}

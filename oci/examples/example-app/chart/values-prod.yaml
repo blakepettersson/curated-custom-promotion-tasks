@@ -1,0 +1,4 @@
+# Rendered on top of values.yaml when the Stage is named "prod". The hydrate
+# task passes values-${{ ctx.stage }}.yaml with ignoreMissingValueFiles, so a
+# Stage with no file of its own gets values.yaml alone.
+replicaCount: 3

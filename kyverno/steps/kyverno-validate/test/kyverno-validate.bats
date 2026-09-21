@@ -2,9 +2,12 @@
 # Behavioural tests for the kyverno-validate step image. Requires bats and
 # docker.
 #
-#   bats test/                                  against the locally built image
-#   IMAGE=ghcr.io/…/kyverno-validate:v0.1.0 bats test/
-#   bats --filter Audit test/                   just the cases you are debugging
+#   bats test/kyverno-validate.bats             against the locally built image
+#   IMAGE=ghcr.io/…/kyverno-validate:v0.1.0 bats test/kyverno-validate.bats
+#   bats --filter Audit test/kyverno-validate.bats   just the cases you debug
+#
+# Named explicitly rather than `bats test/`, which would sweep up
+# e2e-chart.bats and need helm to render the example chart first.
 #
 # See helpers.bash for how a case drives the image.
 
@@ -26,6 +29,29 @@ setup() {
   run_step '{"policies": "policies/*-tag.yaml"}'
   assert_status 0
   assert_jq '.policyFileCount' 1
+}
+
+# The workspace a promotion hands the step is whatever the step before it wrote,
+# and in the e2e suite that is a directory bats made with a bare mkdir — so its
+# mode is the developer's umask. At umask 077 the step, uid 65532, cannot
+# traverse it: every path expands to nothing and the step reports being
+# misconfigured, which is a true statement about the wrong thing. Verified
+# against a 0700 directory on a Linux filesystem: exit 2, `no files matched
+# path "policies"`.
+#
+# This case only *guards* that on Linux, which is where CI runs. A Docker
+# Desktop or OrbStack VM remaps ownership on a bind mount from the host, so on
+# macOS the step reads a 0700 directory regardless and this passes either way.
+@test 'a workspace created under a restrictive umask is still readable' {
+  local work="$BATS_TEST_TMPDIR/umask-077"
+  (
+    umask 077
+    mkdir -p "$work/policies"
+  )
+  cp "$BATS_TEST_DIRNAME"/fixtures/policies/*.yaml "$work/policies/"
+  run_step_in "$work" '{"policies": "policies"}'
+  assert_status 0
+  assert_jq '.policyFileCount' 2
 }
 
 @test 'a list of paths is accepted' {

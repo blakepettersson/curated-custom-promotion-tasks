@@ -1,0 +1,155 @@
+# The Kargo project the real-promotion suite runs: one Warehouse on the seeded
+# Git repository, and two Stages that both hydrate to OCI.
+#
+# `test` is the shape from
+# tasks/publish-manifests-to-oci/examples/entry-stage.yaml — one clone, one
+# render per Stage, one call to the real task — minus its `deploy-oci-to-argocd`
+# step, since this cluster has no Argo CD. It calls the task file itself, not a
+# copy, so a change to the task changes what this suite runs.
+#
+# `ungzipped` is a negative control. It calls the `fixture-ungzipped` task from
+# test/fixtures/broken/, which omits `gzip: true` exactly as a real mistake
+# would, and exists to establish against real Kargo that the resulting promotion
+# goes green while publishing a layer no Argo CD can decompress.
+#
+# @@GIT_REPO@@ and the @@OCI_REPO@@s are substituted by the suite: the registry
+# is addressed by a ClusterIP that is only known once the cluster is up.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Project
+metadata:
+  name: oci-e2e
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Warehouse
+metadata:
+  name: example-app
+  namespace: oci-e2e
+spec:
+  # Short, because the suite waits for the first discovery and nothing here
+  # changes afterwards.
+  interval: 1m
+  subscriptions:
+    - git:
+        repoURL: @@GIT_REPO@@
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: test
+  namespace: oci-e2e
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        direct: true
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: repoURL
+          value: @@GIT_REPO@@
+        - name: ociRepo
+          value: @@OCI_REPO@@
+        - name: chartPath
+          value: chart
+
+      steps:
+        # One clone, pinned to the commit in the Freight, shared by both renders
+        # below — so both Stages' manifests come from the same commit.
+        - uses: git-clone
+          as: clone
+          config:
+            repoURL: ${{ vars.repoURL }}
+            checkout:
+              - commit: ${{ commitFrom(vars.repoURL).ID }}
+                path: ./src
+
+        - uses: helm-template
+          as: render-test
+          config:
+            path: ./src/${{ vars.chartPath }}
+            releaseName: example-app
+            namespace: example-app-test
+            outPath: ./manifests/test
+            outLayout: flat
+            includeCRDs: true
+            valuesFiles:
+              - ./src/${{ vars.chartPath }}/values.yaml
+              - ./src/${{ vars.chartPath }}/values-test.yaml
+            ignoreMissingValueFiles: true
+
+        - uses: helm-template
+          as: render-prod
+          config:
+            path: ./src/${{ vars.chartPath }}
+            releaseName: example-app
+            namespace: example-app-prod
+            outPath: ./manifests/prod
+            outLayout: flat
+            includeCRDs: true
+            valuesFiles:
+              - ./src/${{ vars.chartPath }}/values.yaml
+              - ./src/${{ vars.chartPath }}/values-prod.yaml
+            ignoreMissingValueFiles: true
+
+        - task:
+            name: publish-manifests-to-oci
+            kind: ClusterPromotionTask
+          as: publish
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
+            - name: repoURL
+              value: ${{ vars.repoURL }}
+---
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: ungzipped
+  namespace: oci-e2e
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: example-app
+      sources:
+        direct: true
+
+  promotionTemplate:
+    spec:
+      vars:
+        - name: repoURL
+          value: @@GIT_REPO@@
+        - name: ociRepo
+          value: @@OCI_REPO_UNGZIPPED@@
+
+      steps:
+        - uses: git-clone
+          as: clone
+          config:
+            repoURL: ${{ vars.repoURL }}
+            checkout:
+              - commit: ${{ commitFrom(vars.repoURL).ID }}
+                path: ./src
+
+        - uses: helm-template
+          as: render
+          config:
+            path: ./src/chart
+            releaseName: example-app
+            namespace: example-app-test
+            outPath: ./manifests
+            outLayout: flat
+            includeCRDs: true
+
+        # The fixture, not a task from tasks/: it archives without `gzip: true`
+        # and pushes under oci-push's default `...tar+gzip` layer media type.
+        - task:
+            name: fixture-ungzipped
+            kind: ClusterPromotionTask
+          as: publish
+          vars:
+            - name: ociRepo
+              value: ${{ vars.ociRepo }}
