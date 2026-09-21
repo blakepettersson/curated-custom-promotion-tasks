@@ -152,6 +152,37 @@ it with one negative-control fixture per check, and `e2e-recipe.bats` runs the
 pipeline the task describes against real tools. Vendor only the schemas the
 family uses, and record the upstream commit they came from.
 
+Then promote through a real Kargo: `e2e-kargo.bats` builds a kind cluster,
+installs the chart and runs the task file itself, which is the only check that
+Kargo's steps agree with what the task assumes. A task family ships only YAML,
+so without it nothing in the repository has ever executed. What that costs is a
+few minutes and these traps, all of which cost an hour here first:
+
+- Kargo's enterprise-only pieces cannot be part of it. `CustomPromotionStep` is
+  `ee.kargo.akuity.io`, absent from OSS Kargo, so a step family stays on its
+  bats harness and only task families get this suite.
+- Point the task at the registry's **ClusterIP**. go-containerregistry picks
+  plain HTTP for an RFC1918 address (and for `localhost:`/`*.localhost`), so a
+  10.x address needs no TLS and no `insecureSkipTLSVerify` in the task under
+  test. A Service DNS name would be HTTPS and would need a certificate.
+- A Git server can be nginx over *dumb* HTTP. Kargo shells out to the git CLI,
+  which clones that happily once `git update-server-info` has been run in the
+  bare repository — no Gitea, no database, no user setup. Probe it on TCP, not
+  with an HTTP GET of `/`: its document root is empty until the suite seeds it,
+  nginx answers 403 for a directory it will not index, and the Deployment then
+  never becomes available.
+- `kubectl cp` onto a path that exists copies *into* it. Seeding a repository
+  twice therefore leaves the first one being served, and every case then runs
+  against the previous commit. Remove the destination first.
+- Wait for the Freight carrying the commit you just seeded, not for any Freight,
+  and force discovery with the `kargo.akuity.io/refresh` annotation rather than
+  waiting out the Warehouse's interval.
+- Kargo names Promotions itself, so create with `generateName` and read the name
+  back from `kubectl create -o name`.
+- Never background a shell *function* you intend to kill: `$!` is the subshell's
+  pid, the real process survives the kill, and an orphan holding bats' output
+  descriptor hangs the run after every case has passed.
+
 ## Image conventions
 
 - No `RUN` instructions. Copy binaries out of upstream images
@@ -251,16 +282,20 @@ One workflow per family rather than per task — the suites cover the family.
 
 ## Before you call it done
 
-1. `make lint && make test && make e2e` from the family directory.
+1. `make lint && make test && make e2e` from the family directory, plus
+   `make e2e-kargo` for a task family — it is not part of `make all`, because it
+   builds a cluster.
 2. For a step: `docker buildx build --platform linux/amd64,linux/arm64 --output
    type=cacheonly .` in the step directory — arm64 breaks in ways amd64 does
    not.
 3. For a step, after CI publishes, run the suite against the published image:
-   `IMAGE=ghcr.io/<owner>/<repo>/<step>:main bats test/`. It is the only check
-   that what the registry holds behaves like what you built.
-4. For a task, run a real promotion. The suites check a task against Kargo's
-   schemas and its recipe against real tools, but nothing here executes Kargo,
-   so nothing here proves the task runs. Register it, promote once, and verify
-   the outcome by hand.
+   `IMAGE=ghcr.io/<owner>/<repo>/<step>:main bats test/<step>.bats`. It is the
+   only check that what the registry holds behaves like what you built. Name the
+   file, not `test/` — that sweeps up the e2e suite, which needs helm.
+4. For a task, check what `e2e-kargo.bats` does *not* promote through. It runs
+   the publishing half against a real Kargo; anything needing Argo CD or an
+   external endpoint — `deploy-oci-to-argocd`, `await-oci-deploy` — is still
+   checked against schemas alone, so register those and promote once by hand
+   before relying on them.
 5. Report what you actually ran, and say plainly what you did not. "Tests pass"
    means you ran them; a task nobody has promoted is a task nobody has run.

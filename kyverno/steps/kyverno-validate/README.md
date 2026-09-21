@@ -181,9 +181,13 @@ the way Kargo does: fixtures mounted as the working directory, config in
 `KARGO_OUTPUT`. To run a subset, or to point the suite at a published image:
 
 ```console
-bats --filter Audit test/
-IMAGE=ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:v0.1.0 bats test/
+bats --filter Audit test/kyverno-validate.bats
+IMAGE=ghcr.io/blakepettersson/curated-custom-promotion-tasks/kyverno-validate:v0.1.0 bats test/kyverno-validate.bats
 ```
+
+Each suite is named rather than run as `bats test/`, which would sweep up
+`e2e-chart.bats` too — and that one renders the example chart first, so it needs
+helm. Point it at a published image the same way once helm is on PATH.
 
 To drive it by hand, from this directory:
 

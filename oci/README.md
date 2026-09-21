@@ -15,7 +15,10 @@ apply.
 [akuity/kargo#6893](https://github.com/akuity/kargo/pull/6893) and is **not in a
 released Kargo yet**. These tasks need a Kargo built from `main` at
 `6c2a2a5` or later, and the version they are pinned against is recorded in
-[`test/schemas/README.md`](test/schemas/README.md).
+[`test/schemas/README.md`](test/schemas/README.md). The suite that promotes
+through a real Kargo pins the chart it installs in
+[`test/helpers.bash`](test/helpers.bash), which is the build these tasks are
+known to work against.
 
 For the Argo CD side you need Argo CD with OCI source support, and an
 `Application` annotated `kargo.akuity.io/authorized-stage`.
@@ -403,11 +406,20 @@ Run from this directory:
 make all       # lint, test, e2e
 make test      # every task against Kargo's own step config schemas
 make e2e       # render examples/example-app and push it to a throwaway registry
+make e2e-kargo # promote through a real Kargo in a kind cluster
 ```
 
 `make test` needs [bats](https://github.com/bats-core/bats-core), python3 and
-yq; `make e2e` also needs docker, helm and kustomize. Narrow a run while
-debugging:
+yq; `make e2e` also needs docker, helm and kustomize; `make e2e-kargo` needs
+kind, kubectl, helm and git, and takes a few minutes to build its cluster. It is
+not part of `make all` for that reason — CI runs it as its own job. Keep the
+cluster to iterate against:
+
+```console
+KARGO_E2E_KEEP=1 make e2e-kargo
+```
+
+Narrow a run while debugging:
 
 ```console
 BATS_ARGS='--filter gzip' make test
@@ -422,18 +434,36 @@ it calls. `test/e2e-recipe.bats` renders
 step does, publishes it to a throwaway registry the way `oci-push`'s `srcPath`
 mode does, and reads it back.
 
-Neither runs Kargo — `oci-push --srcPath` is not in a release yet — so the e2e
-suite exercises a *replica* of the steps, written from reading
-`tar_creator.go` and `oci_pusher.go`. It establishes that the recipe is sound;
-it cannot establish that Kargo's implementation agrees byte for byte.
+Neither of those runs Kargo, so the recipe suite exercises a *replica* of the
+steps, written from reading `tar_creator.go` and `oci_pusher.go`. It establishes
+that the recipe is sound; it cannot establish that Kargo's implementation agrees
+byte for byte.
 
-**So before relying on these tasks, run a real promotion.** Register the tasks
-against a Kargo built from `main`, promote once, and check that the artifact
-appears under both tags at one digest and that Argo CD syncs to it. That check
-has not been run here, and nothing in this directory substitutes for it.
+`test/e2e-kargo.bats` is what closes that gap. It stands Kargo up in a kind
+cluster — the unstable chart, since `oci-push --srcPath` is not released — with
+a registry and a Git server beside it, and promotes real Freight through
+[`publish-manifests-to-oci`](tasks/publish-manifests-to-oci) itself, not a copy
+of it. So the assumptions the task rests on are checked against the code that
+implements them: that the layer really is gzip and carries a media type Argo CD
+reads, that both tags resolve to one digest, that the artifact unpacks to one
+directory per Stage each rendered with its own values, that `set-metadata` lands
+where `deploy-oci-to-argocd` reads it, and — as a negative control, with the
+`fixture-ungzipped` task from `test/fixtures/broken/` — that forgetting
+`gzip: true` yields a **green promotion** publishing a layer nothing can
+decompress. Applying the tasks to a real Kargo is a check in itself: the CRD's
+structural schema and its CEL rules are enforced there, and the vendored schemas
+cannot see them.
+
+Two things it still does not cover. **Argo CD**: there is none in the test
+cluster and no status endpoint, so `deploy-oci-to-argocd` and `await-oci-deploy`
+are checked against the schemas and nothing more — before relying on those two,
+point them at a real Argo CD and watch it sync. And **the Kargo it runs is a
+daily build of `main`**, pinned in [`test/helpers.bash`](test/helpers.bash): a
+release may behave differently, and bumping that pin is how you find out.
 
 ## CI
 
 [`../.github/workflows/oci-tasks.yaml`](../.github/workflows/oci-tasks.yaml)
-lints and runs both suites. There is no publish job: the family ships YAML, so a
-merge to `main` is the release.
+lints and runs all three suites, the real-Kargo one as its own job since it
+builds a cluster. There is no publish job: the family ships YAML, so a merge to
+`main` is the release.

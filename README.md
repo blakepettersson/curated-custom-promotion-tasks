@@ -64,8 +64,9 @@ SBOM and provenance attestations, signed with cosign (keyless).
 Pin a released tag or a digest in the `CustomPromotionStep` manifest for
 production use.
 
-A **task** workflow lints and tests, and has no publish job: there is no
-artifact, so a merge to `main` is the release.
+A **task** workflow lints, tests, and promotes the tasks through a real Kargo in
+a kind cluster. It has no publish job: there is no artifact, so a merge to `main`
+is the release.
 
 ## Adding a step
 
@@ -110,3 +111,6 @@ of the list above does not apply. What is left:
    Kargo's own step config schemas, vendored and pinned, and check each example
    against the task it calls. A task is YAML, so every mistake it can hold is
    one Kargo would otherwise report halfway through a release.
+6. Promote it. `oci/test/e2e-kargo.bats` stands a real Kargo up in a kind
+   cluster and runs the task file itself — the only check that Kargo's steps do
+   what the task assumes, and the one thing a family of YAML cannot do without.

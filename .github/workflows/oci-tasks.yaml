@@ -91,3 +91,46 @@ jobs:
 
       - name: End-to-end
         run: make e2e
+
+  # Promotes through a real Kargo: a kind cluster, the Kargo chart, a registry
+  # and a Git server, running the task files themselves. This is the check
+  # oci/README.md asks for before relying on these tasks, and the only one that
+  # can say Kargo's own steps agree with what the tasks assume.
+  #
+  # Its own job because it takes minutes rather than seconds, and because a
+  # failure here means something different from a lint failure: the tasks
+  # describe something Kargo does not do.
+  e2e-kargo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: oci
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned rather than apt's, which lags. bats is not preinstalled on the
+      # runners.
+      - name: Install bats
+        env:
+          BATS_VERSION: 1.13.0
+        run: |
+          curl -fsSL "https://github.com/bats-core/bats-core/archive/refs/tags/v${BATS_VERSION}.tar.gz" | tar -xz
+          sudo "./bats-core-${BATS_VERSION}/install.sh" /usr/local
+          rm -rf "./bats-core-${BATS_VERSION}"
+          bats --version
+
+      - uses: azure/setup-helm@v4
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Install kind
+        env:
+          KIND_VERSION: v0.33.0
+        run: |
+          curl -fsSLo /tmp/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          kind version
+
+      - name: Promote through a real Kargo
+        run: make e2e-kargo

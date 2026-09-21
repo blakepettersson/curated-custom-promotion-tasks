@@ -99,10 +99,13 @@ diagnose() { # message
 }
 
 assert_lint_clean() {
-  [ "$STATUS" = 0 ] && [ -z "$LINT" ] || {
+  # Spelled as an `if` rather than `A && B || C`: shellcheck rejects the latter
+  # (SC2015), and it would be wrong here anyway — C runs when A succeeds and B
+  # fails, which is exactly the case this has to report.
+  if [ "$STATUS" != 0 ] || [ -n "$LINT" ]; then
     diagnose "expected the task to lint clean"
     return 1
-  }
+  fi
 }
 
 assert_lint_fails() {
@@ -247,6 +250,13 @@ fetch_blob() { # repo digest out-file
 # publish-manifests-to-oci/examples/single-stage.yaml does: a flat directory of
 # manifests, CRDs included, with an optional per-stage values overlay that is
 # skipped when absent (ignoreMissingValueFiles).
+#
+# One thing this replica cannot match: the file *names*. `helm template
+# --output-dir` names each file after the template it came from
+# (deployment.yaml), while the step names it after the resource
+# (apps-deployment-example-app-prod-example-app.yaml) — as e2e-kargo.bats sees
+# when it reads a real artifact, and why it finds manifests by content. The
+# layout is the same and nothing downstream reads the names, Argo CD included.
 render_helm() { # stage out-dir
   local stage="$1" out="$2"
   local args=(-f "$EXAMPLE_APP/chart/values.yaml")
@@ -372,4 +382,328 @@ assert_argocd_readable_layer_type() { # media-type
     [ "$1" = "$type" ] && return 0
   done
   fail_with "layer media type \"$1\" is outside Argo CD's default allow-list (${ARGOCD_DEFAULT_LAYER_MEDIA_TYPES[*]})"
+}
+
+# ------------------------------------------------------------------ real Kargo
+
+# Everything below belongs to e2e-kargo.bats, which stands a real Kargo up in a
+# kind cluster and promotes through it. The other two suites need none of it.
+#
+# The versions are pinned. `oci-push`'s local-archive mode (srcPath) is not in a
+# released Kargo, so the chart is an unstable daily build — which means the
+# version here is also the statement of which Kargo these tasks are known to
+# work against. Bump it deliberately, and expect to find out what changed.
+#
+# The image repository has to be overridden alongside it: unstable charts are
+# published with the release chart's default image repository, and unstable
+# images go to a repository of their own.
+KARGO_CLUSTER="${KARGO_CLUSTER:-kargo-oci-e2e}"
+KARGO_CONTEXT="kind-$KARGO_CLUSTER"
+KARGO_CHART="${KARGO_CHART:-oci://ghcr.io/akuity/kargo-charts-unstable/kargo}"
+KARGO_CHART_VERSION="${KARGO_CHART_VERSION:-1.12.0-unstable-20260917}"
+KARGO_IMAGE_REPO="${KARGO_IMAGE_REPO:-ghcr.io/akuity/kargo-unstable}"
+# Kargo's webhook servers are served by cert-manager-issued certificates, so the
+# chart will not install without it.
+CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-1.19.1}"
+
+KARGO_PROJECT=oci-e2e
+KARGO_INFRA_NS=oci-e2e-infra
+KARGO_MANIFESTS="$BATS_TEST_DIRNAME/kargo"
+
+# Where setup_file records what it built, for the cases and teardown_file to
+# read back. A directory rather than variables: bats runs setup_file, each case
+# and teardown_file in separate processes.
+KARGO_STATE="${BATS_FILE_TMPDIR:-${BATS_TEST_TMPDIR:-/tmp}}/kargo-state"
+
+kube() {
+  kubectl --context "$KARGO_CONTEXT" "$@"
+}
+
+kargo_state() { # key [value]
+  mkdir -p "$KARGO_STATE"
+  if [ "$#" -gt 1 ]; then
+    printf '%s\n' "$2" > "$KARGO_STATE/$1"
+  else
+    cat "$KARGO_STATE/$1"
+  fi
+}
+
+# Prints progress where bats will show it during a long setup_file. Without the
+# fd 3 redirect a five-minute cluster build looks like a hang.
+say() { # message
+  printf '# %s\n' "$*" >&3 2>/dev/null || printf '# %s\n' "$*" >&2
+}
+
+# Polls until a command succeeds. Returns non-zero on timeout, having said what
+# it was waiting for, so setup_file fails with a reason rather than a stack.
+retry_until() { # description timeout-seconds command...
+  local description="$1" timeout="$2"
+  shift 2
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if "$@" > /dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  printf 'timed out after %ss waiting for %s\n' "$timeout" "$description" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------- the cluster
+
+start_cluster() {
+  if kind get clusters 2> /dev/null | grep -qxF "$KARGO_CLUSTER"; then
+    say "reusing the kind cluster $KARGO_CLUSTER"
+    return 0
+  fi
+  say "creating the kind cluster $KARGO_CLUSTER"
+  kind create cluster --name "$KARGO_CLUSTER" > /dev/null
+}
+
+delete_cluster() {
+  kind delete cluster --name "$KARGO_CLUSTER" > /dev/null 2>&1 || true
+}
+
+# Both installs are `helm upgrade --install`, so a kept cluster (KARGO_E2E_KEEP)
+# can be reused by the next run without being torn down first.
+install_kargo() {
+  say "installing cert-manager $CERT_MANAGER_VERSION"
+  helm upgrade --install cert-manager cert-manager \
+    --repo https://charts.jetstack.io \
+    --version "$CERT_MANAGER_VERSION" \
+    --kube-context "$KARGO_CONTEXT" \
+    --namespace cert-manager --create-namespace \
+    --set crds.enabled=true \
+    --wait --timeout 6m > /dev/null
+
+  say "installing kargo $KARGO_CHART_VERSION"
+  # The API server is off: these cases drive Kargo with kubectl, and skipping it
+  # skips Dex, the UI and a certificate.
+  helm upgrade --install kargo "$KARGO_CHART" \
+    --version "$KARGO_CHART_VERSION" \
+    --kube-context "$KARGO_CONTEXT" \
+    --namespace kargo --create-namespace \
+    --set image.repository="$KARGO_IMAGE_REPO" \
+    --set api.enabled=false \
+    --wait --timeout 8m > /dev/null
+}
+
+# The registry and the Git server. Records the registry's ClusterIP, which is
+# the address the tasks under test are pointed at: go-containerregistry treats
+# an RFC1918 address as plain HTTP, so no certificate is involved.
+deploy_infra() {
+  say 'deploying the registry and the git server'
+  kube apply -f "$KARGO_MANIFESTS/infra.yaml" > /dev/null
+  kube -n "$KARGO_INFRA_NS" wait --for=condition=available \
+    deploy/registry deploy/git --timeout=180s > /dev/null
+  kargo_state registry-ip "$(kube -n "$KARGO_INFRA_NS" get svc registry -o jsonpath='{.spec.clusterIP}')"
+}
+
+# Publishes oci/examples/example-app as a Git repository the cluster can clone.
+#
+# A bare repository plus `git update-server-info` is all nginx needs to serve a
+# clonable remote over dumb HTTP, which is why there is no Git server to
+# configure here. Seeded with `kubectl cp` so the suite runs against the working
+# tree — including changes that are not committed, let alone pushed.
+seed_git_repo() {
+  local work="$BATS_FILE_TMPDIR/git-work" bare="$BATS_FILE_TMPDIR/example-app.git"
+  say 'seeding the git server with examples/example-app'
+  rm -rf "$work" "$bare"
+  mkdir -p "$work"
+  cp -R "$EXAMPLE_APP/." "$work/"
+  git -C "$work" init -q -b main
+  git -C "$work" add -A
+  git -C "$work" -c user.email=e2e@example.test -c user.name='oci e2e' \
+    commit -q -m 'example app'
+  git clone -q --bare "$work" "$bare"
+  # What makes the bare repository readable over dumb HTTP.
+  git -C "$bare" update-server-info
+
+  local pod served=/usr/share/nginx/html/example-app.git
+  pod="$(kube -n "$KARGO_INFRA_NS" get pod -l app=git -o jsonpath='{.items[0].metadata.name}')"
+  # Removed first: `kubectl cp` onto an existing directory copies *into* it, so
+  # on a reused cluster the previous run's repository would still be the one
+  # served — and the Warehouse would keep discovering its commit.
+  kube -n "$KARGO_INFRA_NS" exec "$pod" -- rm -rf "$served"
+  kube -n "$KARGO_INFRA_NS" cp "$bare" "$pod:$served" > /dev/null
+
+  kargo_state commit "$(git -C "$bare" rev-parse HEAD)"
+  kargo_state git-repo "http://git.$KARGO_INFRA_NS.svc.cluster.local/example-app.git"
+}
+
+# Applies every task in tasks/ — real Kargo's CRD schema and its CEL rules are a
+# check the vendored schemas cannot make — plus the ungzipped fixture the
+# negative control calls, and the project.
+apply_project() {
+  say 'applying the tasks and the project'
+  local task
+  for task in "$TASKS_DIR"/*/cluster-promotion-task.yaml; do
+    kube apply -f "$task" > /dev/null
+  done
+  kube apply -f "$FIXTURES_DIR/broken/ungzipped.yaml" > /dev/null
+
+  local registry_ip rendered
+  registry_ip="$(kargo_state registry-ip)"
+  kargo_state oci-repo "$registry_ip:5000/config/example-app"
+  kargo_state oci-repo-ungzipped "$registry_ip:5000/config/ungzipped"
+  rendered="$BATS_FILE_TMPDIR/project.yaml"
+  sed -e "s|@@GIT_REPO@@|$(kargo_state git-repo)|g" \
+    -e "s|@@OCI_REPO@@|$(kargo_state oci-repo)|g" \
+    -e "s|@@OCI_REPO_UNGZIPPED@@|$(kargo_state oci-repo-ungzipped)|g" \
+    "$KARGO_MANIFESTS/project.yaml" > "$rendered"
+  kube apply -f "$rendered" > /dev/null
+
+  # Refresh rather than wait out the Warehouse's interval, then wait for the
+  # Freight carrying the commit just seeded. Taking whatever Freight exists
+  # would promote the previous run's commit on a reused cluster, and every
+  # assertion about the artifact's provenance would be comparing the seeded
+  # commit against an artifact rendered from an older tree.
+  kube -n "$KARGO_PROJECT" annotate warehouse example-app \
+    kargo.akuity.io/refresh="$(date +%s)" --overwrite > /dev/null
+  retry_until 'the warehouse to discover the seeded commit' 180 freight_for_commit
+  kargo_state freight "$(freight_for_commit)"
+}
+
+# Prints the Freight whose Git commit is the one seed_git_repo published, or
+# nothing if the Warehouse has not discovered it yet.
+freight_for_commit() {
+  local name
+  # shellcheck disable=SC2016  # $commit is jq's --arg, not a shell variable
+  name="$(
+    kube -n "$KARGO_PROJECT" get freight -o json |
+      jqq -r --arg commit "$(kargo_state commit)" \
+        'first(.items[] | select(any(.commits[]?; .id == $commit)) | .metadata.name) // empty'
+  )"
+  [ -n "$name" ] || return 1
+  printf '%s\n' "$name"
+}
+
+# --------------------------------------------------------------- promoting
+
+# Promotes the discovered Freight into a Stage and waits for the promotion to
+# reach a terminal phase — including a failed one, since a case may be asserting
+# that. Records the promotion's name, which Kargo assigns itself.
+promote() { # stage state-key
+  local stage="$1" key="$2" name
+  say "promoting into $stage"
+  name="$(
+    kube create -o name -f - <<EOF
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Promotion
+metadata:
+  generateName: e2e-
+  namespace: $KARGO_PROJECT
+spec:
+  stage: $stage
+  freight: $(kargo_state freight)
+EOF
+  )"
+  name="${name#*/}"
+  kargo_state "$key" "$name"
+  retry_until "the $stage promotion to finish" 300 promotion_finished "$name"
+}
+
+promotion_finished() { # promotion
+  case "$(promotion_field "$1" '{.status.phase}')" in
+    Succeeded | Failed | Errored) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+promotion_field() { # promotion jsonpath
+  kube -n "$KARGO_PROJECT" get promotion "$1" -o jsonpath="$2" 2> /dev/null || true
+}
+
+promotion_phase() { # state-key
+  promotion_field "$(kargo_state "$1")" '{.status.phase}'
+}
+
+# Prints one step's output as JSON. Kargo keys a task's step outputs by
+# `<alias>::<step alias>`, and the task's own output by the alias alone.
+promotion_output() { # state-key key jq-filter
+  kube -n "$KARGO_PROJECT" get promotion "$(kargo_state "$1")" -o json |
+    jqq -r ".status.state[\"$2\"] | $3" 2> /dev/null || true
+}
+
+# The Freight's status metadata, which is where `set-metadata` records the
+# artifact for a downstream Stage in the same pipeline to read back.
+freight_metadata() { # jq-filter
+  kube -n "$KARGO_PROJECT" get freight "$(kargo_state freight)" -o json |
+    jqq -r ".status.metadata | $1" 2> /dev/null || true
+}
+
+# Everything an operator would look at when a promotion does not do what it
+# should: the phase, the message, each step's status, and the controller's own
+# account of it.
+diagnose_kargo() { # message state-key
+  local name
+  name="$(kargo_state "$2" 2> /dev/null || printf '<none>')"
+  printf 'assertion failed: %s\n' "$1"
+  printf '  promotion:  %s\n' "$name"
+  printf '  phase:      %s\n' "$(promotion_field "$name" '{.status.phase}')"
+  printf '  message:    %s\n' "$(promotion_field "$name" '{.status.message}')"
+  printf '  steps:\n'
+  kube -n "$KARGO_PROJECT" get promotion "$name" -o json 2> /dev/null |
+    jqq -r '.status.stepExecutionMetadata // [] | .[] | "    \(.alias // "?") \(.status) \(.message // "")"' 2> /dev/null ||
+    printf '    <none>\n'
+  printf '  controller log (last 40 lines):\n'
+  kube -n kargo logs deploy/kargo-controller --tail=40 2> /dev/null | sed 's/^/    /' ||
+    printf '    <unavailable>\n'
+}
+
+assert_promotion_succeeded() { # state-key
+  [ "$(promotion_phase "$1")" = "Succeeded" ] || {
+    diagnose_kargo "expected the $1 promotion to succeed" "$1"
+    return 1
+  }
+}
+
+# ---------------------------------------------------- registry, from the host
+
+# Forwards the in-cluster registry to a local port and records it where
+# use_registry expects it, so the curl helpers above read the artifact Kargo
+# published exactly as they read the one e2e-recipe.bats pushes.
+start_registry_forward() {
+  local log="$BATS_FILE_TMPDIR/port-forward.log" port i
+  : > "$log"
+  # kubectl directly rather than the `kube` function, and fd 3 closed. Both
+  # matter: backgrounding a function makes `$!` the subshell's PID, so the
+  # teardown kill would leave kubectl orphaned — and an orphan holding bats'
+  # output descriptor keeps the whole run from ever finishing.
+  kubectl --context "$KARGO_CONTEXT" -n "$KARGO_INFRA_NS" \
+    port-forward svc/registry :5000 >> "$log" 2>&1 3>&- &
+  kargo_state forward-pid "$!"
+  for i in $(seq 1 60); do
+    port="$(sed -n 's|^Forwarding from 127\.0\.0\.1:\([0-9]*\).*|\1|p' "$log" | head -1)"
+    [ -n "$port" ] && break
+    sleep 0.5
+  done
+  [ -n "$port" ] || {
+    printf 'the registry port-forward never came up\n' >&2
+    cat "$log" >&2
+    return 1
+  }
+  mkdir -p "$(dirname "$REGISTRY_STATE")"
+  printf 'localhost:%s\n' "$port" > "$REGISTRY_STATE.endpoint"
+  retry_until 'the forwarded registry to answer' 60 \
+    curl -fsS "http://localhost:$port/v2/"
+}
+
+stop_registry_forward() {
+  local pid i
+  pid="$(kargo_state forward-pid 2> /dev/null || true)"
+  if [ -n "$pid" ]; then
+    kill "$pid" 2> /dev/null || true
+    # Confirm it is gone rather than assuming: teardown_file is a different
+    # process than the one that started it, so there is no `wait` to rely on,
+    # and a survivor holds bats open.
+    for i in $(seq 1 20); do
+      kill -0 "$pid" 2> /dev/null || break
+      sleep 0.5
+    done
+    kill -9 "$pid" 2> /dev/null || true
+  fi
+  rm -f "$REGISTRY_STATE.endpoint"
+  return 0
 }
