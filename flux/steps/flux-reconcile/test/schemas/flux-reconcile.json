@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FluxReconcileConfig",
+  "description": "Config of the flux-reconcile custom step. Not vendored: written for this repository, and kept in step with the checks at the top of src/flux-reconcile, which are what the step actually enforces.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kubeconfig", "targets"],
+  "properties": {
+    "kubeconfig": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Contents of a kubeconfig for the cluster Flux runs in, typically ${{ secret('<name>').kubeconfig }}. Static credentials only: the image has no exec credential plugins."
+    },
+    "context": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Context to use from the kubeconfig. Defaults to its current-context."
+    },
+    "timeout": {
+      "type": "string",
+      "pattern": "^([0-9]+|([0-9]+[hms])+)$",
+      "description": "How long to wait for all targets together, as a duration (90s, 10m, 1h30m). Defaults to 10m. Keep it below the step's own timeout in the promotion."
+    },
+    "requireHealthCheck": {
+      "type": "boolean",
+      "description": "Fail any target whose Ready condition would not mean its workloads are healthy: a Kustomization without spec.wait or spec.healthChecks, a HelmRelease with waiting disabled."
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "description": "Flux objects to reconcile, in order.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "name"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["Kustomization", "HelmRelease"]},
+          "name": {"type": "string", "minLength": 1},
+          "namespace": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Defaults to flux-system."
+          },
+          "desiredRevision": {
+            "type": "string",
+            "minLength": 1,
+            "description": "For a Kustomization, a full commit SHA or an OCI digest (with or without its sha1:/sha256: prefix). For a HelmRelease, a chart version or the chart's OCI digest. Without it, the target must have applied what its source holds once refreshed."
+          },
+          "withSource": {
+            "type": "boolean",
+            "description": "Refresh the target's source chain before the target itself. Defaults to true."
+          }
+        }
+      }
+    }
+  }
+}

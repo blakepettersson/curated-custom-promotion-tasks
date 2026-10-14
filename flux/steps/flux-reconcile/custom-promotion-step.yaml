@@ -1,0 +1,57 @@
+# Registers the `flux-reconcile` step with a Kargo cluster. CustomPromotionStep
+# is cluster-scoped and can only be created by a Kargo cluster admin.
+#
+#   kargo apply -f custom-promotion-step.yaml
+#
+# Applied through the Kargo API rather than kubectl: custom steps are an Akuity
+# Platform feature, and the control plane there is not directly reachable.
+#
+# Requires Kargo on the Akuity Platform v1.10+ with the Promotion Controller
+# enabled and a self-hosted agent (custom steps run as pods).
+apiVersion: ee.kargo.akuity.io/v1alpha1
+kind: CustomPromotionStep
+metadata:
+  name: flux-reconcile
+spec:
+  # Published by ../../../.github/workflows/flux-reconcile.yaml, which tags a
+  # release from `flux-reconcile/vX.Y.Z`. Pinned deliberately: `:main` tracks
+  # every push. Swap in a digest if you want it immutable.
+  image: ghcr.io/blakepettersson/curated-custom-promotion-tasks/flux-reconcile:v0.1.0
+
+  command: ["/usr/local/bin/flux-reconcile"]
+
+  env:
+    # The whole step config is handed over as one JSON object, so every key is
+    # optional as far as the expression engine is concerned and the list of
+    # targets survives intact. It carries the kubeconfig, which the step
+    # writes only to its own temporary directory.
+    - name: FLUX_RECONCILE_CONFIG
+      value: ${{ asJSON(config) }}
+
+  # The step writes its results to $KARGO_OUTPUT as JSON.
+  output:
+    source:
+      type: Pipe
+      format: JSON
+
+  # A hard limit on the whole step in a promotion pod: the step is killed at
+  # this point and writes no output. Keep it above the step's own `timeout`
+  # (10m unless configured), which fails with a message saying what Flux was
+  # doing. Raise both together, or set `retry.timeout` on the step.
+  defaultTimeout: 15m
+  # One attempt. The step already rides out what a retry would: it runs
+  # `flux reconcile` again until the source has the revision. What is left — a
+  # failed apply, a failed health check, a suspended object — fails the same
+  # way twice. And the limit above spans every attempt, so a retry after a
+  # timeout would be killed with no output to show for it.
+  # Re-running is safe all the same: all the step does is ask Flux to
+  # reconcile.
+  defaultErrorThreshold: 1
+
+  # The flux CLI waiting on a handful of objects.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

@@ -1,0 +1,350 @@
+#!/bin/sh
+# flux-reconcile — have Flux reconcile now, and check it applied the revision
+# being promoted.
+#
+# Runs as the command of a Kargo `CustomPromotionStep`. Configuration arrives as
+# a single JSON object in $FLUX_RECONCILE_CONFIG (the step spec passes
+# `${{ asJSON(config) }}`), results are written as JSON to $KARGO_OUTPUT.
+#
+# The Flux counterpart of `argocd-update`. For each target, in order, it runs
+# `flux reconcile <kind> --with-source`, which refreshes the source chain,
+# requests the reconcile, refuses a suspended object or source, and waits for
+# Ready. Then it checks what `flux reconcile` cannot be told to: that the
+# revision applied is the one the promotion produced. Without that check, a
+# Git host still serving the previous HEAD just after a push leaves Flux Ready
+# on the old commit and `flux reconcile` exiting 0. On a mismatch the step runs
+# `flux reconcile` again until the revision arrives or the timeout passes.
+#
+# It also reports whether Ready means healthy. A Kustomization without `wait`
+# or `healthChecks` is Ready as soon as its apply succeeds, however broken the
+# workload; the output says `healthChecked: false` for it rather than letting a
+# caller assume otherwise.
+#
+# Exits 0 when every target is at the expected revision, 1 when Flux failed,
+# was suspended, or did not get there in time, and 2 on misconfiguration.
+
+set -eu
+
+CONFIG="${FLUX_RECONCILE_CONFIG-}"
+KARGO_OUTPUT="${KARGO_OUTPUT:-/dev/null}"
+# Pause between `flux reconcile` runs while the source catches up with the
+# desired revision. Overridable so the tests can run faster than a promotion.
+RETRY_SECONDS="${FLUX_RECONCILE_RETRY_SECONDS:-10}"
+
+MAX_TARGETS=20
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+RESULTS="$TMP/results.jsonl"
+: > "$RESULTS"
+
+log() { printf '%s\n' "$*"; }
+
+# --- output -----------------------------------------------------------------
+
+# Every exit goes through here, so a failed promotion still carries the targets
+# that were reconciled and the message saying why the rest were not. Kargo
+# collects the output even when the step exits non-zero.
+finish() { # exit-code message
+  jq -n --arg message "$2" --slurpfile targets "$RESULTS" '{
+    message: $message,
+    targets: $targets,
+    revision: ($targets[0].revision // null),
+    healthChecked: ($targets | length > 0 and all(.healthChecked)),
+  }' > "$KARGO_OUTPUT" || true
+  exit "$1"
+}
+
+fatal() { # message — misconfiguration
+  printf 'flux-reconcile: %s\n' "$1" >&2
+  finish 2 "$1"
+}
+
+fail() { # message — Flux did not get there
+  printf 'flux-reconcile: %s\n' "$1" >&2
+  finish 1 "$1"
+}
+
+# --- configuration ----------------------------------------------------------
+
+# Kargo renders `asJSON(config)` as "null" for a step with no config at all.
+case "$(printf '%s' "$CONFIG" | tr -d ' \t\n')" in
+  '' | null) CONFIG='{}' ;;
+esac
+printf '%s' "$CONFIG" > "$TMP/config.json"
+jq -e 'type == "object"' "$TMP/config.json" > /dev/null 2>&1 ||
+  fatal 'FLUX_RECONCILE_CONFIG must be a JSON object'
+
+# One pass that reports the first problem, so every check happens here at top
+# level — an accessor inside a command substitution cannot exit the script.
+# `has` and explicit type checks rather than `//`, which treats a configured
+# `false` as absent.
+problem="$(jq -r --argjson max "$MAX_TARGETS" '
+  def str($k): has($k) and (.[$k] | type == "string") and (.[$k] != "");
+  def optstr($k): (has($k) | not) or .[$k] == null or str($k);
+  def optbool($k): (has($k) | not) or .[$k] == null or (.[$k] | type == "boolean");
+  def target_problem($i):
+    if type != "object" then "targets[\($i)] must be an object"
+    elif (str("kind") | not) then "targets[\($i)].kind is required"
+    elif (.kind | IN("Kustomization", "HelmRelease") | not) then
+      "targets[\($i)].kind must be Kustomization or HelmRelease, not \(.kind)"
+    elif (str("name") | not) then "targets[\($i)].name is required"
+    elif (optstr("namespace") | not) then "targets[\($i)].namespace must be a non-empty string"
+    elif (optstr("desiredRevision") | not) then "targets[\($i)].desiredRevision must be a non-empty string"
+    elif (optbool("withSource") | not) then "targets[\($i)].withSource must be a boolean"
+    else empty end;
+  if (str("kubeconfig") | not) then
+    "kubeconfig is required: the contents of a kubeconfig for the cluster Flux runs in"
+  elif (optstr("context") | not) then "context must be a non-empty string"
+  elif (optstr("timeout") | not) then "timeout must be a duration such as 10m"
+  elif (optbool("requireHealthCheck") | not) then "requireHealthCheck must be a boolean"
+  elif (has("targets") | not) or (.targets | type != "array") or (.targets | length == 0) then
+    "targets is required: a list of Kustomizations and HelmReleases to reconcile"
+  elif (.targets | length > $max) then "at most \($max) targets per step"
+  else first(.targets | to_entries[] | .key as $i | .value | target_problem($i)) // empty
+  end
+' "$TMP/config.json" 2> "$TMP/jq.err")" || fatal "could not read config: $(head -1 "$TMP/jq.err")"
+[ -z "$problem" ] || fatal "$problem"
+
+cfg() { # jq-filter — prints the value, or nothing for null
+  jq -r "$1 // empty" "$TMP/config.json"
+}
+
+# Go-style durations: 90s, 10m, 1h30m. A bare number is seconds.
+duration_seconds() { # duration
+  printf '%s' "$1" | awk '
+    /^[0-9]+$/ { print $0; exit 0 }
+    /^([0-9]+[hms])+$/ {
+      s = $0; total = 0
+      while (match(s, /^[0-9]+[hms]/)) {
+        n = substr(s, 1, RLENGTH - 1); u = substr(s, RLENGTH, 1)
+        total += n * (u == "h" ? 3600 : (u == "m" ? 60 : 1))
+        s = substr(s, RLENGTH + 1)
+      }
+      print total; exit 0
+    }
+    { exit 1 }
+  '
+}
+
+TIMEOUT="$(cfg .timeout)"
+TIMEOUT="${TIMEOUT:-10m}"
+TIMEOUT_SECONDS="$(duration_seconds "$TIMEOUT")" ||
+  fatal "timeout must be a duration such as 10m or 90s, not $TIMEOUT"
+[ "$TIMEOUT_SECONDS" -gt 0 ] || fatal "timeout must be longer than zero"
+
+REQUIRE_HEALTH="$(jq -r 'if .requireHealthCheck == true then "true" else "false" end' "$TMP/config.json")"
+
+# The kubeconfig is written into the step's private temporary directory, never
+# the shared workspace: every later step in the promotion can read that.
+umask 077
+jq -r '.kubeconfig' "$TMP/config.json" > "$TMP/kubeconfig"
+umask 022
+export KUBECONFIG="$TMP/kubeconfig"
+# kubectl caches API discovery under $HOME/.kube; keep that with the
+# kubeconfig, in the directory the EXIT trap removes.
+export HOME="$TMP"
+
+CONTEXT="$(cfg .context)"
+if [ -n "$CONTEXT" ]; then
+  kubectl config use-context "$CONTEXT" > /dev/null 2> "$TMP/err" ||
+    fatal "context $CONTEXT: $(head -1 "$TMP/err")"
+fi
+
+# Parsed here, so a kubeconfig that is not one is reported as the
+# misconfiguration it is, rather than as a failure to reach the first target.
+# --minify also insists on a current context.
+kubectl config view --minify > /dev/null 2> "$TMP/err" ||
+  fatal "kubeconfig: $(head -1 "$TMP/err")"
+
+jq -c '.targets[]' "$TMP/config.json" > "$TMP/targets"
+
+DEADLINE=$(($(date +%s) + TIMEOUT_SECONDS))
+
+# --- revisions --------------------------------------------------------------
+
+remaining() { echo $((DEADLINE - $(date +%s))); }
+
+# Whether a Flux revision is the one asked for. Flux writes revisions as
+# `<ref>@<algo>:<hash>` — `main@sha1:<commit>` for Git, `<tag>@sha256:<digest>`
+# for OCI — so a commit SHA or a digest matches the part after the `@`, with or
+# without its algorithm. The ref name before the `@` deliberately never
+# matches: `main` would match every commit on main.
+revision_matches() { # revision desired
+  jq -n -e --arg rev "$1" --arg want "$2" '
+    $rev == $want or
+    ($rev | split("@") | length == 2 and
+      (.[1] == $want or (.[1] | sub("^[a-z0-9]+:"; "")) == $want))
+  ' > /dev/null
+}
+
+# --- targets ----------------------------------------------------------------
+
+resource_for() { # kind
+  case "$1" in
+    Kustomization) printf 'kustomizations.kustomize.toolkit.fluxcd.io' ;;
+    HelmRelease) printf 'helmreleases.helm.toolkit.fluxcd.io' ;;
+  esac
+}
+
+# Fetches the target into $TMP/obj.json.
+get_target() {
+  kubectl -n "$T_NS" get "$(resource_for "$T_KIND")" "$T_NAME" -o json \
+    > "$TMP/obj.json" 2> "$TMP/err" < /dev/null
+}
+
+record() { # ready(true|false) message
+  jq -c -n \
+    --arg kind "$T_KIND" --arg ns "$T_NS" --arg name "$T_NAME" \
+    --arg revision "${T_REVISION:-}" --arg desired "$T_WANT" \
+    --argjson health "${T_HEALTH:-false}" --argjson ready "$1" --arg message "$2" '
+    {kind: $kind, namespace: $ns, name: $name,
+     revision: (if $revision == "" then null else $revision end),
+     desiredRevision: (if $desired == "" then null else $desired end),
+     healthChecked: $health, ready: $ready, message: $message}
+  ' >> "$RESULTS"
+}
+
+fail_target() { # message
+  record false "$1"
+  fail "$1"
+}
+
+# Whether Ready=True on this object means its workloads were checked, or only
+# that the apply went through.
+health_checked() {
+  case "$T_KIND" in
+    Kustomization)
+      jq -r '.spec.wait == true or ((.spec.healthChecks // []) | length > 0)' "$TMP/obj.json" ;;
+    HelmRelease)
+      jq -r '(.spec.install.disableWait != true) and (.spec.upgrade.disableWait != true)' "$TMP/obj.json" ;;
+  esac
+}
+
+# The revision the target reports having applied: the source revision for a
+# Kustomization, the chart version of the deployed release for a HelmRelease.
+applied_revision() {
+  case "$T_KIND" in
+    Kustomization) jq -r '.status.lastAppliedRevision // ""' "$TMP/obj.json" ;;
+    HelmRelease)
+      jq -r '(.status.history // [])[0] | if . != null and .status == "deployed" then .chartVersion // "" else "" end' \
+        "$TMP/obj.json" ;;
+  esac
+}
+
+# For a HelmRelease the desired revision is a chart version — `0.2.0` also
+# matches the `0.2.0+<digest>` helm-controller records for a chart from an
+# OCIRepository — or the chart's OCI digest.
+at_desired_revision() { # applied
+  [ -n "$1" ] || return 1
+  case "$T_KIND" in
+    Kustomization) revision_matches "$1" "$T_WANT" ;;
+    HelmRelease)
+      jq -e --arg want "$T_WANT" '
+        ((.status.history // [])[0]) as $h
+        | $h.chartVersion == $want or ($h.chartVersion | split("+")[0]) == $want
+          or ($h.ociDigest // "") == $want
+      ' "$TMP/obj.json" > /dev/null
+      ;;
+  esac
+}
+
+# Flux's own account of a failure. `flux reconcile` reports a reconcile that
+# never turned Ready only as "context deadline exceeded"; the Ready condition
+# says why.
+ready_reason() {
+  get_target 2> /dev/null || return 0
+  jq -r '.status.conditions // [] | map(select(.type == "Ready")) | .[0]
+    | if . == null then "" else "\(.reason): \(.message)" end' "$TMP/obj.json"
+}
+
+reconcile_target() {
+  T_REVISION='' T_HEALTH=false
+  log "$T_KIND $T_NS/$T_NAME"
+
+  # Read once before asking for anything: a target that does not exist or
+  # cannot be read is a misconfiguration, and its health checks decide
+  # whether requireHealthCheck lets it through.
+  if ! get_target; then
+    record false "$(head -1 "$TMP/err")"
+    if grep -qi 'NotFound\|not found\|forbidden\|unauthorized\|must be logged in' "$TMP/err"; then
+      fatal "$T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")"
+    fi
+    fail "$T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")"
+  fi
+  T_HEALTH="$(health_checked)"
+  if [ "$T_HEALTH" != true ]; then
+    if [ "$REQUIRE_HEALTH" = true ]; then
+      fail_target "$T_KIND $T_NS/$T_NAME does not check workload health (no spec.wait or spec.healthChecks, or waiting disabled), and requireHealthCheck is set"
+    fi
+    log "  note: Ready on this $T_KIND means applied, not healthy: it has no health checks"
+  fi
+
+  kind_arg="$(printf '%s' "$T_KIND" | tr '[:upper:]' '[:lower:]')"
+  mismatch=''
+  while :; do
+    left="$(remaining)"
+    [ "$left" -gt 0 ] || left=1
+    if [ "$T_WITH_SOURCE" = true ]; then
+      set -- --with-source
+    else
+      set --
+    fi
+    if flux reconcile "$kind_arg" "$T_NAME" -n "$T_NS" --timeout "${left}s" "$@" \
+      > "$TMP/flux.out" 2>&1 < /dev/null; then
+      rc=0
+    else
+      rc=$?
+    fi
+    sed 's/^/  /' "$TMP/flux.out"
+
+    if [ "$rc" != 0 ]; then
+      # A retry that ran out of time is still the revision never arriving:
+      # say that, not what the last `flux reconcile` said about its deadline.
+      if [ -n "$mismatch" ] && [ "$(remaining)" -le 0 ]; then
+        fail_target "timed out after $TIMEOUT: $T_KIND $T_NS/$T_NAME applied ${T_REVISION:-nothing}, expected $T_WANT"
+      fi
+      said="$(grep '✗' "$TMP/flux.out" | tail -1 | sed 's/^ *✗ *//')"
+      reason="$(ready_reason)"
+      T_REVISION="$(applied_revision 2> /dev/null || true)"
+      fail_target "flux reconcile $kind_arg $T_NS/$T_NAME failed: ${said:-exit $rc}${reason:+; Ready is $reason}"
+    fi
+
+    get_target || fail_target "$T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")"
+    T_REVISION="$(applied_revision)"
+    if [ -z "$T_WANT" ] || at_desired_revision "$T_REVISION"; then
+      break
+    fi
+    if [ "$(remaining)" -le 0 ]; then
+      fail_target "timed out after $TIMEOUT: $T_KIND $T_NS/$T_NAME applied ${T_REVISION:-nothing}, expected $T_WANT"
+    fi
+    mismatch=1
+    log "  applied ${T_REVISION:-nothing}, not $T_WANT; reconciling again in ${RETRY_SECONDS}s"
+    sleep "$RETRY_SECONDS"
+  done
+
+  if [ "$T_HEALTH" = true ]; then
+    record true "applied $T_REVISION and passed its health checks"
+  else
+    record true "applied $T_REVISION; health not checked"
+  fi
+}
+
+# --- main -------------------------------------------------------------------
+
+count=0
+while IFS= read -r target <&3; do
+  T_KIND="$(printf '%s' "$target" | jq -r '.kind')"
+  T_NAME="$(printf '%s' "$target" | jq -r '.name')"
+  T_NS="$(printf '%s' "$target" | jq -r '.namespace // "flux-system"')"
+  T_WANT="$(printf '%s' "$target" | jq -r '.desiredRevision // ""')"
+  T_WITH_SOURCE="$(printf '%s' "$target" | jq -r 'if .withSource == false then "false" else "true" end')"
+  reconcile_target
+  count=$((count + 1))
+done 3< "$TMP/targets"
+
+if [ "$(jq -s 'all(.healthChecked)' "$RESULTS")" = true ]; then
+  finish 0 "reconciled $count Flux object(s); all applied the expected revision and passed their health checks"
+fi
+finish 0 "reconciled $count Flux object(s); all applied the expected revision, but not all check workload health"
