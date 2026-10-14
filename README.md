@@ -23,6 +23,7 @@ One directory per tool, each self-contained with its own examples, tests and
 
 | Family | Contents |
 |---|---|
+| [`flux/`](flux) | [`flux-reconcile`](flux/steps/flux-reconcile) — reconciles Flux Kustomizations and HelmReleases and waits for the promoted revision, the Flux counterpart of `argocd-update` |
 | [`kyverno/`](kyverno) | [`kyverno-validate`](kyverno/steps/kyverno-validate) — validates Kyverno policies with the Kyverno CLI and checks manifests against them |
 | [`oci/`](oci) | [`publish-manifests-to-oci`](oci/tasks/publish-manifests-to-oci) — publish rendered manifests as an OCI artifact; [`deploy-oci-to-argocd`](oci/tasks/deploy-oci-to-argocd), [`await-oci-deploy`](oci/tasks/await-oci-deploy) — deploy one, reachable cluster or not |
 

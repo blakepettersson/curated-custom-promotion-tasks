@@ -1,0 +1,96 @@
+# Promotes a chart version to a HelmRelease that Flux manages from Git — the
+# Flux counterpart of the usual git-push-then-argocd-update flow.
+#
+#   1. commit the chart version from the Freight into the HelmRelease manifest
+#   2. push it
+#   3. have Flux fetch that commit, apply it, and upgrade the release, waiting
+#      at each link for the revision this promotion produced
+#
+# Register it once per Kargo cluster, along with the flux-reconcile step
+# (../custom-promotion-step.yaml), then call it from a Stage (stage.yaml). The
+# repository layout it assumes is ../../../examples/flux-app.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ClusterPromotionTask
+metadata:
+  name: promote-chart-to-flux
+spec:
+  vars:
+    # Git repository Flux reconciles from. Required.
+    - name: repoURL
+    # The chart's OCI repository, as the Warehouse subscribes to it. Required.
+    - name: chartRepoURL
+    # The branch Flux's GitRepository tracks.
+    - name: branch
+      value: main
+    # The HelmRelease manifest within the repository.
+    - name: helmReleasePath
+      value: apps/demo/helmrelease.yaml
+    # The Flux objects to reconcile, in the cluster Flux runs in.
+    - name: fluxNamespace
+      value: flux-system
+    - name: kustomization
+      value: apps
+    - name: helmRelease
+      value: demo
+    # A generic Secret in the project namespace whose `kubeconfig` key reaches
+    # that cluster (kargo-secret.yaml).
+    - name: fluxCredentials
+      value: flux-cluster
+
+  steps:
+    - uses: git-clone
+      as: clone
+      config:
+        repoURL: ${{ vars.repoURL }}
+        checkout:
+          - branch: ${{ vars.branch }}
+            path: ./repo
+
+    - uses: yaml-update
+      as: bump
+      config:
+        path: ./repo/${{ vars.helmReleasePath }}
+        updates:
+          - key: spec.chart.spec.version
+            value: ${{ chartFrom(vars.chartRepoURL).Version }}
+
+    - uses: git-commit
+      as: commit
+      config:
+        path: ./repo
+        message: |
+          Promote ${{ ctx.stage }} to chart ${{ chartFrom(vars.chartRepoURL).Version }}
+
+    - uses: git-push
+      as: push
+      config:
+        path: ./repo
+
+    # Each target's desiredRevision is what this promotion produced: the commit
+    # just pushed, and the chart version just written into it. Without them,
+    # the step would accept whatever revision the source held once refreshed —
+    # which, a moment after a push, may still be the previous one.
+    - uses: flux-reconcile
+      as: reconcile
+      config:
+        kubeconfig: ${{ secret(vars.fluxCredentials).kubeconfig }}
+        timeout: 10m
+        targets:
+          - kind: Kustomization
+            name: ${{ vars.kustomization }}
+            namespace: ${{ vars.fluxNamespace }}
+            desiredRevision: ${{ task.outputs.push.commit }}
+          - kind: HelmRelease
+            name: ${{ vars.helmRelease }}
+            namespace: ${{ vars.fluxNamespace }}
+            desiredRevision: ${{ chartFrom(vars.chartRepoURL).Version }}
+
+    - uses: compose-output
+      as: output
+      config:
+        commit: ${{ task.outputs.push.commit }}
+        chartVersion: ${{ chartFrom(vars.chartRepoURL).Version }}
+        # False when a target's Ready only means "applied" — say so in a
+        # verification or a notification rather than calling it healthy.
+        healthChecked: ${{ task.outputs.reconcile.healthChecked }}
+        summary: ${{ task.outputs.reconcile.message }}

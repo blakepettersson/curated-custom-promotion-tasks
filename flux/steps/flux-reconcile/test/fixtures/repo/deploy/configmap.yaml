@@ -1,0 +1,8 @@
+# The Kustomization cases' payload. No namespace: each case applies it into
+# its own through spec.targetNamespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo
+data:
+  version: "1"

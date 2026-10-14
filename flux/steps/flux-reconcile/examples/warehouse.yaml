@@ -1,0 +1,11 @@
+# Discovers new versions of the chart. The Stage promotes them.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Warehouse
+metadata:
+  name: demo
+  namespace: flux-demo
+spec:
+  subscriptions:
+    - chart:
+        repoURL: oci://ghcr.io/example/charts/demo
+        semverConstraint: ^0.1.0

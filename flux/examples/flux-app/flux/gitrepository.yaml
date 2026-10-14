@@ -1,0 +1,12 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: flux-app
+  namespace: flux-system
+spec:
+  # Kargo's pushes are what move this, and flux-reconcile asks for a fetch
+  # straight after each one: the interval is only a backstop.
+  interval: 1h
+  url: https://github.com/example/flux-app.git
+  ref:
+    branch: main

@@ -1,0 +1,29 @@
+# A Stage that promotes chart versions to a Flux-managed HelmRelease. The task
+# does the whole flow; the Stage names the repositories.
+#
+# Needs, in the project namespace, the Secret in kargo-secret.yaml.
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: prod
+  namespace: flux-demo
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: demo
+      sources:
+        direct: true
+
+  promotionTemplate:
+    spec:
+      steps:
+        - task:
+            name: promote-chart-to-flux
+            kind: ClusterPromotionTask
+          as: promote
+          vars:
+            - name: repoURL
+              value: https://github.com/example/flux-app.git
+            - name: chartRepoURL
+              value: oci://ghcr.io/example/charts/demo

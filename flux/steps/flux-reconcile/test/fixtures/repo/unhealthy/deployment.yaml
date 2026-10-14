@@ -1,0 +1,17 @@
+# Applies cleanly and never becomes Available: the image cannot be pulled.
+# Without `wait` a Kustomization over it is Ready=True all the same.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unhealthy
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: unhealthy}
+  template:
+    metadata:
+      labels: {app: unhealthy}
+    spec:
+      containers:
+        - name: missing
+          image: registry.invalid/does-not-exist:1
