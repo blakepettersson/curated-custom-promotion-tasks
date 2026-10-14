@@ -27,10 +27,6 @@ spec:
     # writes only to its own temporary directory.
     - name: FLUX_RECONCILE_CONFIG
       value: ${{ asJSON(config) }}
-    # Stamped into each reconcile request, so an object's status shows which
-    # promotion last asked for it.
-    - name: KARGO_PROMOTION
-      value: ${{ ctx.promotion }}
 
   # The step writes its results to $KARGO_OUTPUT as JSON.
   output:
@@ -43,16 +39,16 @@ spec:
   # (10m unless configured), which fails with a message saying what Flux was
   # doing. Raise both together, or set `retry.timeout` on the step.
   defaultTimeout: 15m
-  # One attempt. The step already rides out what a retry would: it ignores API
-  # errors while polling and asks a source again until it has the revision.
-  # What is left — a failed apply, a failed health check, a suspended object —
-  # fails the same way twice. And the limit above spans every attempt, so a
-  # retry after a timeout would be killed with no output to show for it.
+  # One attempt. The step already rides out what a retry would: it runs
+  # `flux reconcile` again until the source has the revision. What is left — a
+  # failed apply, a failed health check, a suspended object — fails the same
+  # way twice. And the limit above spans every attempt, so a retry after a
+  # timeout would be killed with no output to show for it.
   # Re-running is safe all the same: all the step does is ask Flux to
   # reconcile.
   defaultErrorThreshold: 1
 
-  # kubectl and jq polling a handful of objects.
+  # The flux CLI waiting on a handful of objects.
   resources:
     requests:
       cpu: 50m

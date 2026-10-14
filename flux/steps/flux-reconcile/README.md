@@ -4,17 +4,14 @@ A Kargo custom promotion step that does for Flux what `argocd-update` does for
 Argo CD: after a promotion has pushed a change, it has Flux reconcile **now**,
 and waits until Flux has applied the revision that promotion produced.
 
-For each target, in order:
+For each target, in order, it runs `flux reconcile <kind> --with-source`, which
+refreshes the source chain (GitRepository, OCIRepository, HelmChart and so on),
+requests the reconcile, and waits for Ready. Then it checks the one thing
+`flux reconcile` cannot be asked to: that the revision applied is the one the
+promotion produced.
 
-1. refresh the target's source chain — GitRepository, OCIRepository, Bucket,
-   HelmRepository, HelmChart — deepest first, so the new revision is fetched
-   now rather than at the next interval;
-2. request a reconcile of the Kustomization or HelmRelease itself;
-3. wait until Flux has handled *that* request, the object is Ready, and it has
-   applied the expected revision.
-
-It changes no spec and touches no workload: all it writes is the
-`reconcile.fluxcd.io/requestedAt` annotation, as `flux reconcile` does.
+It changes no spec and touches no workload: all `flux reconcile` writes is the
+`reconcile.fluxcd.io/requestedAt` annotation.
 
 ```yaml
 - uses: flux-reconcile
@@ -34,35 +31,38 @@ It changes no spec and touches no workload: all it writes is the
 is the whole flow — bump a chart version in Git, push, reconcile — and
 [`examples/stage.yaml`](examples/stage.yaml) calls it.
 
-## Why not `flux reconcile`, or annotate-and-wait-for-Ready
+## What it adds to `flux reconcile`
 
-The obvious step is a kubectl annotate followed by a wait for the request to be
-handled and the object Ready. Against Flux v2.9 controllers, that reports
-success in each of these cases when nothing new was deployed. Each is a case in
+Against Flux v2.9, each of these is a case in
 [`test/flux-reconcile.bats`](test/flux-reconcile.bats):
 
-- **Ready on the old revision.** A Kustomization reconciled without its source
-  handles the request and reports `Ready=True` — on the revision it already
-  had. The step refreshes the source first, and checks the *applied* revision,
-  not just the condition.
-- **Suspended objects look reconciled.** A suspended Kustomization stamps the
-  request as handled (`lastHandledReconcileAt` equals the token), keeps its old
-  `Ready=True` and its `observedGeneration` current, and applies nothing. The
-  step refuses a suspended target or source before asking for anything.
+- **The revision.** `flux reconcile` takes no expected revision, and exits 0 on
+  whatever the source held when it looked. A Git host can serve the previous
+  HEAD for a moment after a push, and a source fetched then is Ready on the
+  wrong commit. Given a `desiredRevision`, the step compares the applied
+  revision and runs `flux reconcile` again until it matches or the timeout
+  passes.
+- **Why it failed.** A reconcile that fails — a manifest the API server
+  rejects, a failed health check, a dependency that is not ready — keeps
+  `flux reconcile` waiting until its timeout, and it then reports only
+  "context deadline exceeded". The step adds the Ready condition's reason and
+  message, which is what Flux actually said.
 - **Ready is not healthy.** A Kustomization without `wait` or `healthChecks`
   is `Ready=True` as soon as its apply succeeds — here, with a Deployment whose
   image cannot be pulled. The step reports `healthChecked: false` for such a
   target rather than calling it healthy, and `requireHealthCheck: true` fails
   it outright.
-- **A push is not instantly visible.** A Git host can serve the previous HEAD
-  for a moment after a push, and a source fetched then is Ready on the wrong
-  commit. Given a `desiredRevision`, the step asks the source again until it has
-  that revision, or times out saying what it has instead.
 
-`flux reconcile --with-source`, which the step was first modelled on, takes no
-revision to wait for, so it cannot say whether the one a promotion produced was
-applied. The step uses kubectl instead, and reads the status fields it decides
-on itself.
+What `flux reconcile` does that the step relies on, and that the suite holds it
+to: it refuses a suspended target or source ("resource is suspended") rather
+than reporting a reconcile that a suspended object would mark handled and never
+perform, and with `--with-source` it refreshes a HelmRelease's whole chain —
+GitRepository, then HelmChart, then the release.
+
+**A failure takes the whole timeout.** Because `flux reconcile` does not stop on
+a failed reconcile, a broken commit fails the step at `timeout` (10m unless
+configured), not as soon as Flux reports it. Set `timeout` to what you would
+wait for a healthy rollout.
 
 ## Config
 
@@ -79,10 +79,10 @@ on itself.
 | `timeout` | | `10m` | For all targets together: `90s`, `10m`, `1h30m`. |
 | `requireHealthCheck` | | `false` | Fail a target whose Ready would not mean healthy. |
 
-Without a `desiredRevision`, a Kustomization must have applied what its source
-holds once refreshed, and a HelmRelease the chart its source holds. Set it
+Without a `desiredRevision`, the step accepts whatever `flux reconcile` reports
+applied — with `withSource`, what the source held once refreshed. Set it
 whenever the promotion knows the revision — after a `git-push`, that is
-`outputs.<alias>.commit` — or the step will accept whatever the source had.
+`outputs.<alias>.commit` — or a source fetched a moment too early passes.
 
 A short SHA does not match, and nor does a ref name: `main` would match every
 commit on main.
@@ -91,7 +91,7 @@ The step's `timeout` must fit inside the promotion's own limit on the step,
 `defaultTimeout: 15m` in
 [`custom-promotion-step.yaml`](custom-promotion-step.yaml). At that limit the
 step is killed and writes no output; at its own timeout it fails saying what
-Flux was doing. If you raise `timeout`, set the step's `retry.timeout` above it.
+Flux reported. If you raise `timeout`, set the step's `retry.timeout` above it.
 
 ## Output
 
@@ -104,7 +104,6 @@ Flux was doing. If you raise `timeout`, set the step's `retry.timeout` above it.
     {
       "kind": "Kustomization", "namespace": "flux-system", "name": "apps",
       "revision": "main@sha1:4f1c…", "desiredRevision": "4f1c…",
-      "source": {"kind": "GitRepository", "namespace": "flux-system", "name": "flux-app", "revision": "main@sha1:4f1c…"},
       "healthChecked": true, "ready": true,
       "message": "applied main@sha1:4f1c… and passed its health checks"
     }
@@ -120,12 +119,7 @@ target reached so far; the failing one has `ready: false` and the reason.
 |---|---|
 | 0 | Every target applied the expected revision. |
 | 1 | Flux failed to apply or pass health checks, a target or source is suspended, or the timeout passed. |
-| 2 | Misconfiguration: bad config, or a target that does not exist or that the kubeconfig may not read. |
-
-A failed apply or health check fails at once with Flux's own reason. Reasons
-Flux retries by itself — `DependencyNotReady`, `SourceNotReady`,
-`ArtifactFailed` — are waited out, since this very step has usually just set
-the source moving.
+| 2 | Misconfiguration: bad config, a kubeconfig that does not parse, or a target that does not exist or that the kubeconfig may not read. |
 
 ## Credentials
 
@@ -163,8 +157,8 @@ project may reach is decided by the RBAC behind the kubeconfig it holds.
   request; it needs `flux reconcile hr --reset` or `--force`. The step makes no
   such request: promoting a new chart version changes the spec, which starts a
   fresh attempt anyway.
-- **ExternalArtifact and other source kinds** are left to Flux: the step
-  refreshes only the source kinds listed above, and logs that it skipped one.
+- **Source kinds `flux reconcile --with-source` does not handle** are left to
+  Flux's own interval.
 - **Changing what Flux deploys.** The step never edits a source's ref the way
   `argocd-update` can set `targetRevision`. The promotion's Git commit is the
   change; this step only makes Flux act on it now and confirms it did.

@@ -357,9 +357,7 @@ run_step() { # config-json [docker args...]
       -v "$BATS_TEST_TMPDIR:/out" \
       -e FLUX_RECONCILE_CONFIG="$config" \
       -e KARGO_OUTPUT=/out/output.json \
-      -e KARGO_PROMOTION=suite \
-      -e FLUX_RECONCILE_POLL_SECONDS=1 \
-      -e FLUX_RECONCILE_REREQUEST_SECONDS=3 \
+      -e FLUX_RECONCILE_RETRY_SECONDS=2 \
       "$@" \
       "$IMAGE" 2>&1
   )" && STATUS=0 || STATUS=$?

@@ -1,31 +1,24 @@
 #!/bin/sh
-# flux-reconcile — have Flux reconcile now, and wait until it has applied the
-# revision being promoted.
+# flux-reconcile — have Flux reconcile now, and check it applied the revision
+# being promoted.
 #
 # Runs as the command of a Kargo `CustomPromotionStep`. Configuration arrives as
 # a single JSON object in $FLUX_RECONCILE_CONFIG (the step spec passes
 # `${{ asJSON(config) }}`), results are written as JSON to $KARGO_OUTPUT.
 #
-# The Flux counterpart of `argocd-update`: for each target, in order,
+# The Flux counterpart of `argocd-update`. For each target, in order, it runs
+# `flux reconcile <kind> --with-source`, which refreshes the source chain,
+# requests the reconcile, refuses a suspended object or source, and waits for
+# Ready. Then it checks what `flux reconcile` cannot be told to: that the
+# revision applied is the one the promotion produced. Without that check, a
+# Git host still serving the previous HEAD just after a push leaves Flux Ready
+# on the old commit and `flux reconcile` exiting 0. On a mismatch the step runs
+# `flux reconcile` again until the revision arrives or the timeout passes.
 #
-#   1. refresh its source chain — GitRepository, OCIRepository, Bucket,
-#      HelmRepository, HelmChart — so the target sees the new revision now
-#      rather than at the next interval;
-#   2. request a reconcile of the Kustomization or HelmRelease itself;
-#   3. wait until Flux has handled *that* request, reports Ready, and has
-#      applied the revision expected of it.
-#
-# Every check in step 3 is there because Flux reports success without it.
-# Proved against Flux v2.9 controllers and encoded in test/flux-reconcile.bats:
-#
-#   * A Kustomization reconciled without its source handles the request and
-#     reports Ready=True — on the revision it already had.
-#   * A *suspended* object stamps the request as handled, keeps its old Ready
-#     condition and applies nothing. Ready=True and a matching token are not
-#     evidence that anything happened.
-#   * A Kustomization without `wait` or `healthChecks` reports Ready=True as
-#     soon as the apply succeeds, however broken the workload is. Ready then
-#     means "applied", not "healthy", and the output says which it was.
+# It also reports whether Ready means healthy. A Kustomization without `wait`
+# or `healthChecks` is Ready as soon as its apply succeeds, however broken the
+# workload; the output says `healthChecked: false` for it rather than letting a
+# caller assume otherwise.
 #
 # Exits 0 when every target is at the expected revision, 1 when Flux failed,
 # was suspended, or did not get there in time, and 2 on misconfiguration.
@@ -34,14 +27,10 @@ set -eu
 
 CONFIG="${FLUX_RECONCILE_CONFIG-}"
 KARGO_OUTPUT="${KARGO_OUTPUT:-/dev/null}"
-# The promotion's name, for the reconcile token: it shows in each object's
-# annotations and status which promotion asked for the reconcile.
-PROMOTION="${KARGO_PROMOTION:-}"
-# Polling cadence. Overridable so the tests can run faster than a promotion.
-POLL_SECONDS="${FLUX_RECONCILE_POLL_SECONDS:-3}"
-REREQUEST_SECONDS="${FLUX_RECONCILE_REREQUEST_SECONDS:-15}"
+# Pause between `flux reconcile` runs while the source catches up with the
+# desired revision. Overridable so the tests can run faster than a promotion.
+RETRY_SECONDS="${FLUX_RECONCILE_RETRY_SECONDS:-10}"
 
-REQUESTED_AT='reconcile.fluxcd.io/requestedAt'
 MAX_TARGETS=20
 
 TMP="$(mktemp -d)"
@@ -173,76 +162,9 @@ jq -c '.targets[]' "$TMP/config.json" > "$TMP/targets"
 
 DEADLINE=$(($(date +%s) + TIMEOUT_SECONDS))
 
-# --- kubernetes -------------------------------------------------------------
-
-resource_for() { # kind
-  case "$1" in
-    Kustomization) printf 'kustomizations.kustomize.toolkit.fluxcd.io' ;;
-    HelmRelease) printf 'helmreleases.helm.toolkit.fluxcd.io' ;;
-    GitRepository) printf 'gitrepositories.source.toolkit.fluxcd.io' ;;
-    OCIRepository) printf 'ocirepositories.source.toolkit.fluxcd.io' ;;
-    Bucket) printf 'buckets.source.toolkit.fluxcd.io' ;;
-    HelmRepository) printf 'helmrepositories.source.toolkit.fluxcd.io' ;;
-    HelmChart) printf 'helmcharts.source.toolkit.fluxcd.io' ;;
-    *) return 1 ;;
-  esac
-}
-
-# Fetches an object into $TMP/obj.json. On failure, $TMP/err holds kubectl's
-# message and GET_ERROR one of: missing, denied, other.
-get_obj() { # kind namespace name
-  GET_ERROR=''
-  if kubectl -n "$2" get "$(resource_for "$1")" "$3" -o json \
-    > "$TMP/obj.json" 2> "$TMP/err" < /dev/null; then
-    return 0
-  fi
-  if grep -qi 'NotFound\|not found' "$TMP/err"; then
-    GET_ERROR=missing
-  elif grep -qi 'forbidden\|unauthorized\|must be logged in' "$TMP/err"; then
-    GET_ERROR=denied
-  else
-    GET_ERROR=other
-  fi
-  return 1
-}
-
-new_token() {
-  printf 'kargo-%s-%s-%s' "${PROMOTION:-manual}" "$(date +%s)" \
-    "$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
-}
-
-request_reconcile() { # kind namespace name token
-  kubectl -n "$2" annotate --overwrite "$(resource_for "$1")" "$3" \
-    "$REQUESTED_AT=$4" > /dev/null 2> "$TMP/err" < /dev/null ||
-    fail_target "could not request a reconcile of $1 $2/$3: $(head -1 "$TMP/err")"
-}
-
-# Where an object stands with respect to the request carrying `token`:
-#
-#   suspended    spec.suspend is set: Flux will stamp the token and do nothing
-#   pending      the request is not handled yet, or a newer generation is not
-#                observed yet, or Ready is Unknown (reconciling)
-#   ready        handled, current, Ready=True
-#   failed       handled, current, Ready=False
-#
-# Also prints the Ready reason and message, tab-separated.
-object_state() { # token
-  jq -r --arg t "$1" '
-    (.status.conditions // [] | map(select(.type == "Ready")) | .[0]) as $r
-    | (if .spec.suspend == true then "suspended"
-      elif (.status.lastHandledReconcileAt // "") != $t then "pending"
-      elif (.status.observedGeneration // -1) != .metadata.generation then "pending"
-      elif $r == null then "pending"
-      elif $r.status == "True" then "ready"
-      elif $r.status == "False" then "failed"
-      else "pending" end) as $state
-    | [$state, ($r.reason // ""), ($r.message // "" | gsub("[\t\n]"; " "))] | @tsv
-  ' "$TMP/obj.json"
-}
-
-expired() { [ "$(date +%s)" -ge "$DEADLINE" ]; }
-
 # --- revisions --------------------------------------------------------------
+
+remaining() { echo $((DEADLINE - $(date +%s))); }
 
 # Whether a Flux revision is the one asked for. Flux writes revisions as
 # `<ref>@<algo>:<hash>` — `main@sha1:<commit>` for Git, `<tag>@sha256:<digest>`
@@ -257,110 +179,29 @@ revision_matches() { # revision desired
   ' > /dev/null
 }
 
-# --- sources ----------------------------------------------------------------
+# --- targets ----------------------------------------------------------------
 
-# Refreshes one source and waits for it. With `want`, keeps asking until the
-# source's artifact is that revision: a Git host can serve the previous HEAD
-# for a moment after a push, and a source fetched in that moment is Ready on
-# the wrong commit.
-reconcile_source() { # kind namespace name want
-  kind="$1" ns="$2" name="$3" want="$4"
-  get_obj "$kind" "$ns" "$name" ||
-    fail_target "$kind $ns/$name, the source of $T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")"
-  if [ "$kind" = HelmRepository ] && [ "$(jq -r '.spec.type // ""' "$TMP/obj.json")" = oci ]; then
-    log "  $kind $ns/$name is an OCI HelmRepository, which has no index to refresh"
-    return 0
-  fi
-  [ "$(jq -r '.spec.suspend // false' "$TMP/obj.json")" != true ] ||
-    fail_target "$kind $ns/$name is suspended: Flux would mark the reconcile handled and fetch nothing"
-
-  token="$(new_token)" state='' reason='' revision=''
-  request_reconcile "$kind" "$ns" "$name" "$token"
-  log "  requested $kind $ns/$name"
-  rerequest_at=$(($(date +%s) + REREQUEST_SECONDS))
-  while :; do
-    if get_obj "$kind" "$ns" "$name"; then
-      object_state "$token" > "$TMP/state"
-      IFS="$(printf '\t')" read -r state reason message < "$TMP/state" || true
-      revision="$(jq -r '.status.artifact.revision // ""' "$TMP/obj.json")"
-      case "$state" in
-        suspended)
-          fail_target "$kind $ns/$name was suspended while it was being reconciled" ;;
-        failed)
-          fail_target "$kind $ns/$name failed: $reason: $message" ;;
-        ready)
-          if [ -z "$want" ] || revision_matches "$revision" "$want"; then
-            log "  $kind $ns/$name is at $revision"
-            SOURCE_REVISION="$revision"
-            return 0
-          fi
-          if [ "$(date +%s)" -ge "$rerequest_at" ]; then
-            token="$(new_token)"
-            log "  $kind $ns/$name is at $revision, not $want; requesting again"
-            request_reconcile "$kind" "$ns" "$name" "$token"
-            rerequest_at=$(($(date +%s) + REREQUEST_SECONDS))
-          fi
-          ;;
-      esac
-    fi
-    if expired; then
-      if [ -n "$want" ]; then
-        fail_target "timed out after $TIMEOUT waiting for $kind $ns/$name to fetch $want; it is at ${revision:-no revision}"
-      fi
-      fail_target "timed out after $TIMEOUT waiting for $kind $ns/$name: ${state:-not handled}${reason:+ ($reason)}"
-    fi
-    sleep "$POLL_SECONDS"
-  done
-}
-
-# Writes the target's source chain to $TMP/chain as `kind<TAB>ns<TAB>name`
-# lines, deepest first, from the target object in $TMP/obj.json. A HelmChart's
-# own source comes before it, since the chart is built from that source's
-# artifact.
-source_chain() {
-  : > "$TMP/chain"
-  case "$T_KIND" in
-    Kustomization)
-      jq -r --arg ns "$T_NS" '.spec.sourceRef | [.kind, (.namespace // $ns), .name] | @tsv' \
-        "$TMP/obj.json" >> "$TMP/chain"
-      ;;
-    HelmRelease)
-      if [ "$(jq -r 'has("spec") and (.spec | has("chartRef"))' "$TMP/obj.json")" = true ]; then
-        jq -r --arg ns "$T_NS" '.spec.chartRef | [.kind, (.namespace // $ns), .name] | @tsv' \
-          "$TMP/obj.json" > "$TMP/chart"
-      else
-        # helm-controller names the HelmChart it generates <namespace>-<name>,
-        # in the namespace of the chart's source, and records it in status.
-        jq -r --arg ns "$T_NS" --arg name "$T_NAME" '
-          (.status.helmChart // ((.spec.chart.spec.sourceRef.namespace // $ns) + "/" + $ns + "-" + $name))
-          | split("/") | ["HelmChart", .[0], .[1]] | @tsv
-        ' "$TMP/obj.json" > "$TMP/chart"
-      fi
-      IFS="$(printf '\t')" read -r ckind cns cname < "$TMP/chart" || true
-      if [ "$ckind" = HelmChart ] && get_obj HelmChart "$cns" "$cname"; then
-        jq -r --arg ns "$cns" '.spec.sourceRef | [.kind, $ns, .name] | @tsv' \
-          "$TMP/obj.json" >> "$TMP/chain"
-      fi
-      cat "$TMP/chart" >> "$TMP/chain"
-      ;;
+resource_for() { # kind
+  case "$1" in
+    Kustomization) printf 'kustomizations.kustomize.toolkit.fluxcd.io' ;;
+    HelmRelease) printf 'helmreleases.helm.toolkit.fluxcd.io' ;;
   esac
 }
 
-# --- targets ----------------------------------------------------------------
+# Fetches the target into $TMP/obj.json.
+get_target() {
+  kubectl -n "$T_NS" get "$(resource_for "$T_KIND")" "$T_NAME" -o json \
+    > "$TMP/obj.json" 2> "$TMP/err" < /dev/null
+}
 
 record() { # ready(true|false) message
   jq -c -n \
     --arg kind "$T_KIND" --arg ns "$T_NS" --arg name "$T_NAME" \
     --arg revision "${T_REVISION:-}" --arg desired "$T_WANT" \
-    --arg skind "${S_KIND:-}" --arg sns "${S_NS:-}" --arg sname "${S_NAME:-}" \
-    --arg srev "${SOURCE_REVISION:-}" \
     --argjson health "${T_HEALTH:-false}" --argjson ready "$1" --arg message "$2" '
     {kind: $kind, namespace: $ns, name: $name,
      revision: (if $revision == "" then null else $revision end),
      desiredRevision: (if $desired == "" then null else $desired end),
-     source: (if $skind == "" then null else
-       {kind: $skind, namespace: $sns, name: $sname,
-        revision: (if $srev == "" then null else $srev end)} end),
      healthChecked: $health, ready: $ready, message: $message}
   ' >> "$RESULTS"
 }
@@ -382,7 +223,7 @@ health_checked() {
 }
 
 # The revision the target reports having applied: the source revision for a
-# Kustomization, the chart version for a HelmRelease.
+# Kustomization, the chart version of the deployed release for a HelmRelease.
 applied_revision() {
   case "$T_KIND" in
     Kustomization) jq -r '.status.lastAppliedRevision // ""' "$TMP/obj.json" ;;
@@ -392,62 +233,46 @@ applied_revision() {
   esac
 }
 
-# Whether the applied revision is the expected one. For a HelmRelease the
-# desired revision is a chart version — `0.2.0` also matches the `0.2.0+<digest>`
-# helm-controller records for a chart from an OCIRepository — or the chart's
-# OCI digest. Without a desired revision, the target must have applied what its
-# source now holds.
-at_expected_revision() { # applied
+# For a HelmRelease the desired revision is a chart version — `0.2.0` also
+# matches the `0.2.0+<digest>` helm-controller records for a chart from an
+# OCIRepository — or the chart's OCI digest.
+at_desired_revision() { # applied
   [ -n "$1" ] || return 1
   case "$T_KIND" in
-    Kustomization)
-      if [ -n "$T_WANT" ]; then
-        revision_matches "$1" "$T_WANT"
-      else
-        [ -z "${SOURCE_REVISION:-}" ] || [ "$1" = "$SOURCE_REVISION" ]
-      fi
-      ;;
+    Kustomization) revision_matches "$1" "$T_WANT" ;;
     HelmRelease)
-      jq -e --arg want "$T_WANT" --arg src "${SOURCE_REVISION:-}" '
+      jq -e --arg want "$T_WANT" '
         ((.status.history // [])[0]) as $h
-        | if $want != "" then
-            $h.chartVersion == $want or ($h.chartVersion | split("+")[0]) == $want
-            or ($h.ociDigest // "") == $want
-          elif $src == "" then true
-          else
-            $h.chartVersion == $src
-            or (($src | split("@") | length == 2) and ($h.ociDigest // "") == ($src | split("@")[1]))
-          end
+        | $h.chartVersion == $want or ($h.chartVersion | split("+")[0]) == $want
+          or ($h.ociDigest // "") == $want
       ' "$TMP/obj.json" > /dev/null
       ;;
   esac
 }
 
-# Ready=False reasons Flux retries on its own, which a moment later can turn
-# into success: a dependency or a source still catching up, typically because
-# this very step just refreshed it.
-transient_reason() { # reason
-  case "$1" in
-    DependencyNotReady | SourceNotReady | ArtifactFailed | Progressing) return 0 ;;
-    *) return 1 ;;
-  esac
+# Flux's own account of a failure. `flux reconcile` reports a reconcile that
+# never turned Ready only as "context deadline exceeded"; the Ready condition
+# says why.
+ready_reason() {
+  get_target 2> /dev/null || return 0
+  jq -r '.status.conditions // [] | map(select(.type == "Ready")) | .[0]
+    | if . == null then "" else "\(.reason): \(.message)" end' "$TMP/obj.json"
 }
 
 reconcile_target() {
-  T_REVISION='' T_HEALTH=false SOURCE_REVISION='' S_KIND='' S_NS='' S_NAME=''
+  T_REVISION='' T_HEALTH=false
   log "$T_KIND $T_NS/$T_NAME"
 
-  if ! get_obj "$T_KIND" "$T_NS" "$T_NAME"; then
-    case "$GET_ERROR" in
-      missing | denied)
-        record false "$(head -1 "$TMP/err")"
-        fatal "$T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")" ;;
-      *) fail_target "$T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")" ;;
-    esac
+  # Read once before asking for anything: a target that does not exist or
+  # cannot be read is a misconfiguration, and its health checks decide
+  # whether requireHealthCheck lets it through.
+  if ! get_target; then
+    record false "$(head -1 "$TMP/err")"
+    if grep -qi 'NotFound\|not found\|forbidden\|unauthorized\|must be logged in' "$TMP/err"; then
+      fatal "$T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")"
+    fi
+    fail "$T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")"
   fi
-  [ "$(jq -r '.spec.suspend // false' "$TMP/obj.json")" != true ] ||
-    fail_target "$T_KIND $T_NS/$T_NAME is suspended: Flux would mark the reconcile handled and apply nothing"
-
   T_HEALTH="$(health_checked)"
   if [ "$T_HEALTH" != true ]; then
     if [ "$REQUIRE_HEALTH" = true ]; then
@@ -456,69 +281,54 @@ reconcile_target() {
     log "  note: Ready on this $T_KIND means applied, not healthy: it has no health checks"
   fi
 
-  if [ "$T_WITH_SOURCE" = true ]; then
-    source_chain
-    # The last link is the target's direct source: the one the desired
-    # revision is checked against, for a Kustomization. A HelmRelease's
-    # desired revision is a chart version, checked on the release itself.
-    last="$(wc -l < "$TMP/chain" | tr -d ' ')"
-    i=0
-    while IFS="$(printf '\t')" read -r skind sns sname <&3; do
-      i=$((i + 1))
-      if ! resource_for "$skind" > /dev/null; then
-        log "  $skind $sns/$sname is not a source this step can refresh; leaving it to Flux"
-        continue
-      fi
-      want=''
-      [ "$i" = "$last" ] && [ "$T_KIND" = Kustomization ] && want="$T_WANT"
-      SOURCE_REVISION=''
-      reconcile_source "$skind" "$sns" "$sname" "$want"
-      if [ "$i" = "$last" ]; then
-        S_KIND="$skind" S_NS="$sns" S_NAME="$sname"
-      fi
-    done 3< "$TMP/chain"
-    [ -n "$S_KIND" ] || SOURCE_REVISION=''
-  fi
-
-  token="$(new_token)"
-  request_reconcile "$T_KIND" "$T_NS" "$T_NAME" "$token"
-  log "  requested $T_KIND $T_NS/$T_NAME"
-
-  said='' state='' reason='' message=''
+  kind_arg="$(printf '%s' "$T_KIND" | tr '[:upper:]' '[:lower:]')"
+  mismatch=''
   while :; do
-    if get_obj "$T_KIND" "$T_NS" "$T_NAME"; then
-      object_state "$token" > "$TMP/state"
-      IFS="$(printf '\t')" read -r state reason message < "$TMP/state" || true
-      T_REVISION="$(applied_revision)"
-      case "$state" in
-        suspended)
-          fail_target "$T_KIND $T_NS/$T_NAME was suspended while it was being reconciled" ;;
-        failed)
-          transient_reason "$reason" ||
-            fail_target "$T_KIND $T_NS/$T_NAME failed: $reason: $message" ;;
-        ready)
-          if at_expected_revision "$T_REVISION"; then
-            if [ "$T_HEALTH" = true ]; then
-              log "  ready and healthy at $T_REVISION"
-              record true "applied $T_REVISION and passed its health checks"
-            else
-              log "  applied $T_REVISION (health not checked)"
-              record true "applied $T_REVISION; health not checked"
-            fi
-            return 0
-          fi
-          if [ -z "$said" ]; then
-            log "  Ready at ${T_REVISION:-no deployed revision}; waiting for ${T_WANT:-${SOURCE_REVISION:-the new revision}}"
-            said=1
-          fi
-          ;;
-      esac
+    left="$(remaining)"
+    [ "$left" -gt 0 ] || left=1
+    if [ "$T_WITH_SOURCE" = true ]; then
+      set -- --with-source
+    else
+      set --
     fi
-    if expired; then
-      fail_target "timed out after $TIMEOUT waiting for $T_KIND $T_NS/$T_NAME: ${state:-unknown}${reason:+ ($reason${message:+: $message})}; applied ${T_REVISION:-nothing}, expected ${T_WANT:-${SOURCE_REVISION:-the source revision}}"
+    if flux reconcile "$kind_arg" "$T_NAME" -n "$T_NS" --timeout "${left}s" "$@" \
+      > "$TMP/flux.out" 2>&1 < /dev/null; then
+      rc=0
+    else
+      rc=$?
     fi
-    sleep "$POLL_SECONDS"
+    sed 's/^/  /' "$TMP/flux.out"
+
+    if [ "$rc" != 0 ]; then
+      # A retry that ran out of time is still the revision never arriving:
+      # say that, not what the last `flux reconcile` said about its deadline.
+      if [ -n "$mismatch" ] && [ "$(remaining)" -le 0 ]; then
+        fail_target "timed out after $TIMEOUT: $T_KIND $T_NS/$T_NAME applied ${T_REVISION:-nothing}, expected $T_WANT"
+      fi
+      said="$(grep '✗' "$TMP/flux.out" | tail -1 | sed 's/^ *✗ *//')"
+      reason="$(ready_reason)"
+      T_REVISION="$(applied_revision 2> /dev/null || true)"
+      fail_target "flux reconcile $kind_arg $T_NS/$T_NAME failed: ${said:-exit $rc}${reason:+; Ready is $reason}"
+    fi
+
+    get_target || fail_target "$T_KIND $T_NS/$T_NAME: $(head -1 "$TMP/err")"
+    T_REVISION="$(applied_revision)"
+    if [ -z "$T_WANT" ] || at_desired_revision "$T_REVISION"; then
+      break
+    fi
+    if [ "$(remaining)" -le 0 ]; then
+      fail_target "timed out after $TIMEOUT: $T_KIND $T_NS/$T_NAME applied ${T_REVISION:-nothing}, expected $T_WANT"
+    fi
+    mismatch=1
+    log "  applied ${T_REVISION:-nothing}, not $T_WANT; reconciling again in ${RETRY_SECONDS}s"
+    sleep "$RETRY_SECONDS"
   done
+
+  if [ "$T_HEALTH" = true ]; then
+    record true "applied $T_REVISION and passed its health checks"
+  else
+    record true "applied $T_REVISION; health not checked"
+  fi
 }
 
 # --- main -------------------------------------------------------------------
